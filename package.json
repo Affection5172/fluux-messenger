@@ -1,0 +1,38 @@
+{
+  "name": "fluux",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "version": "0.11.0",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @xmpp/fluux",
+    "build": "npm run build -w @fluux/sdk && npm run build -w @xmpp/fluux",
+    "build:sdk": "npm run build -w @fluux/sdk",
+    "build:app": "npm run build -w @xmpp/fluux",
+    "pretest": "npm run typecheck",
+    "test": "npm run test:run --workspaces --if-present",
+    "test:coverage": "npm run test:coverage --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "clean": "npm run clean --workspaces --if-present",
+    "clean:all": "npm run clean --workspaces --if-present && rm -rf node_modules",
+    "tauri:dev": "npm run build:sdk && npm run tauri:dev -w @xmpp/fluux",
+    "tauri:build": "npm run build:sdk && npm run tauri:build -w @xmpp/fluux",
+    "release:prepare": "node scripts/prepare-release.js",
+    "docs": "npm run docs -w @fluux/sdk",
+    "docs:watch": "npm run docs:watch -w @fluux/sdk"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@tauri-apps/plugin-deep-link": "^2.4.5"
+  }
+}

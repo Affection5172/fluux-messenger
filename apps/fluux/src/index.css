@@ -1,0 +1,214 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Theme CSS Variables */
+:root {
+  /* Dark mode (default) */
+  color-scheme: dark;
+  --fluux-bg: #1e1f22;
+  --fluux-bg-secondary: #1a1b1e;
+  --fluux-sidebar: #2b2d31;
+  --fluux-chat: #313338;
+  --fluux-hover: #35373c;
+  --fluux-active: #404249;
+  --fluux-selection: rgba(88, 101, 242, 0.25);
+  --fluux-text: #dbdee1;
+  --fluux-muted: #949ba4;
+  --fluux-link: #00a8fc;
+  --fluux-brand: #5865f2;
+  --fluux-brand-hover: #4752c4;
+  --fluux-green: #23a559;
+  --fluux-yellow: #f0b232;
+  --fluux-red: #da373c;
+  --fluux-gray: #80848e;
+  --fluux-border: rgba(0, 0, 0, 0.1);
+  --scrollbar-thumb: #1a1b1e;
+  --scrollbar-thumb-hover: #2b2d31;
+}
+
+/* Light mode (Discord-inspired) */
+.light {
+  color-scheme: light;
+  --fluux-bg: #e3e5e8;
+  --fluux-bg-secondary: #d8dadf;
+  --fluux-sidebar: #ebedef;
+  --fluux-chat: #ffffff;
+  --fluux-hover: #dcdee3;
+  --fluux-active: #d0d3d8;
+  --fluux-selection: rgba(88, 101, 242, 0.15);
+  --fluux-text: #2e3338;
+  --fluux-muted: #4a4d54;
+  --fluux-link: #0068e0;
+  --fluux-gray: #9ca3af;
+  --fluux-border: rgba(0, 0, 0, 0.15);
+  --scrollbar-thumb: #c4c9ce;
+  --scrollbar-thumb-hover: #a8adb3;
+}
+
+/* Custom scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+/* Smooth scrolling */
+html {
+  scroll-behavior: smooth;
+}
+
+/* Ensure full height layout - fixes macOS fullscreen white space issue */
+/* Set background color on html to prevent white flash when resizing window */
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: var(--fluux-bg);
+  /* Note: overscroll-behavior removed to allow native bounce in child scroll containers */
+}
+
+#root {
+  height: 100%;
+}
+
+/* Allow native rubber band effect within scrollable elements (macOS) */
+/* Using 'auto' enables the visual bounce, while 'none' on html/body prevents whole-page bounce */
+/* -webkit-overflow-scrolling: touch enables momentum/bounce scrolling in WebKit */
+.overflow-y-auto, .overflow-auto, .overscroll-auto {
+  overscroll-behavior: auto !important;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Remove default focus outline */
+*:focus {
+  outline: none;
+}
+
+/* Focus ring system - only show after user has interacted */
+/* The 'user-interacted' class is added to html on first mouse/keyboard input */
+/* Exclude .no-focus-ring elements (large containers that shouldn't show focus) */
+.user-interacted *:focus:not(html):not(body):not(#root):not(.no-focus-ring) {
+  outline: 2px solid rgba(88, 101, 242, 0.5);
+  outline-offset: -2px;
+}
+
+/* Focus zone styling - only show after user interaction */
+.user-interacted .focus-zone:focus {
+  outline: 2px solid rgba(88, 101, 242, 0.5) !important;
+  outline-offset: -2px !important;
+}
+
+/* Message input auto-resize - JS handles height, CSS ensures proper text wrapping */
+.message-input {
+  min-height: 44px;
+  max-height: 200px;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+/* Tauri window title bar integration */
+/* Enable drag region for elements with data-tauri-drag-region attribute */
+[data-tauri-drag-region] {
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+/* Message highlight animation for reply navigation */
+@keyframes message-highlight {
+  0% {
+    background-color: var(--fluux-brand);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.message-highlight {
+  animation: message-highlight 1.5s ease-out;
+  border-radius: 0.5rem;
+}
+
+/* Bounce effect for keyboard navigation at boundaries */
+@keyframes bounce-top {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(8px); }
+}
+
+@keyframes bounce-bottom {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-8px); }
+}
+
+.bounce-top {
+  animation: bounce-top 0.3s ease-out;
+}
+
+.bounce-bottom {
+  animation: bounce-bottom 0.3s ease-out;
+}
+
+/* Christmas animation - falling particles with sway */
+@keyframes fall {
+  0% {
+    transform: translateY(0) translateX(0) rotate(0deg);
+    opacity: 1;
+  }
+  25% {
+    transform: translateY(25vh) translateX(var(--sway, 30px)) rotate(90deg);
+  }
+  50% {
+    transform: translateY(50vh) translateX(calc(var(--sway, 30px) * -0.5)) rotate(180deg);
+  }
+  75% {
+    transform: translateY(75vh) translateX(var(--sway, 30px)) rotate(270deg);
+  }
+  100% {
+    transform: translateY(105vh) translateX(0) rotate(360deg);
+    opacity: 0.3;
+  }
+}
+
+.animate-fall {
+  animation: fall linear forwards;
+  will-change: transform, opacity;
+}
+
+/* Typing indicator animation - three dots bouncing */
+@keyframes typing-dot {
+  0%, 60%, 100% {
+    transform: translateY(0);
+    opacity: 0.5;
+  }
+  30% {
+    transform: translateY(-2px);
+    opacity: 1;
+  }
+}
+
+.animate-typing-dot-1 {
+  animation: typing-dot 1.2s ease-in-out infinite;
+  animation-delay: 0s;
+}
+
+.animate-typing-dot-2 {
+  animation: typing-dot 1.2s ease-in-out infinite;
+  animation-delay: 0.2s;
+}
+
+.animate-typing-dot-3 {
+  animation: typing-dot 1.2s ease-in-out infinite;
+  animation-delay: 0.4s;
+}

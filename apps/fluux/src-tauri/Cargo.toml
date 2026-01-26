@@ -1,0 +1,47 @@
+[package]
+name = "fluux"
+version = "0.11.0"
+description = "A powerful, productive messaging client that's pleasant to use."
+authors = ["ProcessOne"]
+license = "AGPL-3.0-or-later"
+repository = ""
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools", "unstable"] }
+tauri-plugin-shell = "2"
+tauri-plugin-os = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-deep-link = "2"
+tauri-plugin-process = "2"
+serde = { version = "1", features = ["derive"] }
+
+# Updater plugin for auto-updates (desktop only)
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"
+serde_json = "1"
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+reqwest = { version = "0.12", features = ["blocking"] }
+scraper = "0.22"
+
+# user-idle for non-macOS platforms (macOS uses ioreg directly)
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+user-idle = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSNotification", "NSString", "NSThread", "NSProcessInfo"] }
+objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication"] }
+block2 = "0.6"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = "debuginfo"  # Use debuginfo instead of true to keep symbols needed by Tauri updater

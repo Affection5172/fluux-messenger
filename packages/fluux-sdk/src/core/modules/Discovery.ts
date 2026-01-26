@@ -1,0 +1,237 @@
+import { xml, Element } from '@xmpp/client'
+import { BaseModule } from './BaseModule'
+import { getDomain } from '../jid'
+import { generateUUID } from '../../utils/uuid'
+import {
+  NS_DISCO_INFO,
+  NS_DISCO_ITEMS,
+  NS_HTTP_UPLOAD,
+} from '../namespaces'
+import type { UploadSlot } from '../types'
+
+/**
+ * Service discovery and HTTP file upload module.
+ *
+ * Handles server capability discovery and file upload service:
+ * - XEP-0030: Service Discovery (disco#info, disco#items)
+ * - XEP-0363: HTTP File Upload (service discovery, upload slot requests)
+ *
+ * @remarks
+ * Server features are discovered on connection and stored in the connection
+ * store. HTTP upload service is discovered separately via disco#items.
+ *
+ * @example
+ * ```typescript
+ * // Access via XMPPClient
+ * client.discovery.fetchServerInfo()
+ * client.discovery.discoverHttpUploadService()
+ *
+ * // Request upload slot for file sharing
+ * const slot = await client.discovery.requestUploadSlot('photo.jpg', 1024000, 'image/jpeg')
+ * // PUT file to slot.putUrl, then share slot.getUrl in message
+ * ```
+ *
+ * @category Modules
+ */
+export class Discovery extends BaseModule {
+  handle(_stanza: Element): boolean | void {
+    // Discovery doesn't handle incoming stanzas (responses handled via IQ caller)
+    return false
+  }
+
+  /**
+   * Fetch server features via disco#info (XEP-0030).
+   * Queries the server domain to discover supported features and identities.
+   */
+  async fetchServerInfo(): Promise<void> {
+    const currentJid = this.deps.getCurrentJid()
+    if (!currentJid) return
+
+    // Query the server domain (bare domain, not full JID)
+    const domain = getDomain(currentJid)
+    if (!domain) return
+
+    const iq = xml(
+      'iq',
+      { type: 'get', to: domain, id: `disco_${generateUUID()}` },
+      xml('query', { xmlns: NS_DISCO_INFO })
+    )
+
+    try {
+      const result = await this.deps.sendIQ(iq)
+      const query = result.getChild('query', NS_DISCO_INFO)
+      if (!query) return
+
+      // Parse identities
+      const identities = query.getChildren('identity').map((identity: Element) => ({
+        category: identity.attrs.category || '',
+        type: identity.attrs.type || '',
+        name: identity.attrs.name,
+      }))
+
+      // Parse features
+      const features = query.getChildren('feature')
+        .map((feature: Element) => feature.attrs.var as string)
+        .filter(Boolean)
+        .sort()
+
+      // Emit SDK event for server info
+      const serverInfo = { domain, identities, features }
+      this.deps.emitSDK('connection:server-info', { info: serverInfo })
+
+      this.deps.emitSDK('console:event', {
+        message: `Server ${domain}: ${features.length} features discovered`,
+        category: 'connection',
+      })
+    } catch (err) {
+      // Server disco#info not available - that's fine, not all servers support it
+      console.warn('[Discovery] Failed to fetch server disco#info:', err)
+    }
+  }
+
+  /**
+   * Discover HTTP Upload service (XEP-0363).
+   * Queries disco#items to find upload service, then queries its disco#info
+   * for capabilities (max file size).
+   */
+  async discoverHttpUploadService(): Promise<void> {
+    const currentJid = this.deps.getCurrentJid()
+    if (!currentJid) return
+
+    const domain = getDomain(currentJid)
+    if (!domain) return
+
+    try {
+      // 1. Query disco#items on server domain
+      const itemsIq = xml(
+        'iq',
+        { type: 'get', to: domain, id: `items_${generateUUID()}` },
+        xml('query', { xmlns: NS_DISCO_ITEMS })
+      )
+      const itemsResult = await this.deps.sendIQ(itemsIq)
+
+      // 2. For each item, query disco#info to find HTTP Upload feature
+      const items = itemsResult.getChild('query', NS_DISCO_ITEMS)?.getChildren('item') || []
+
+      for (const item of items) {
+        const itemJid = item.attrs.jid
+        if (!itemJid) continue
+
+        try {
+          const infoIq = xml(
+            'iq',
+            { type: 'get', to: itemJid, id: `info_${generateUUID()}` },
+            xml('query', { xmlns: NS_DISCO_INFO })
+          )
+          const infoResult = await this.deps.sendIQ(infoIq)
+
+          // Check for HTTP Upload feature
+          const query = infoResult.getChild('query', NS_DISCO_INFO)
+          const features = query?.getChildren('feature') || []
+          const hasUpload = features.some((f: Element) => f.attrs.var === NS_HTTP_UPLOAD)
+
+          if (hasUpload) {
+            // Extract max-file-size from x-data form if present
+            let maxFileSize: number | undefined
+            const xForm = query?.getChild('x', 'jabber:x:data')
+            if (xForm) {
+              const fields = xForm.getChildren('field') || []
+              for (const field of fields) {
+                if (field.attrs.var === 'max-file-size') {
+                  const value = field.getChildText('value')
+                  if (value) {
+                    maxFileSize = parseInt(value, 10)
+                  }
+                  break
+                }
+              }
+            }
+
+            const uploadService = { jid: itemJid, maxFileSize }
+            this.deps.emitSDK('connection:http-upload-service', { service: uploadService })
+
+            this.deps.emitSDK('console:event', {
+              message: `HTTP Upload service discovered: ${itemJid}${maxFileSize ? ` (max ${Math.round(maxFileSize / 1024 / 1024)}MB)` : ''}`,
+              category: 'connection',
+            })
+            return
+          }
+        } catch {
+          // Failed to query this item, continue to next
+        }
+      }
+
+      // No HTTP Upload service found
+      this.deps.emitSDK('connection:http-upload-service', { service: null })
+    } catch (err) {
+      // disco#items not available
+      console.warn('[Discovery] Failed to discover HTTP Upload service:', err)
+      this.deps.emitSDK('connection:http-upload-service', { service: null })
+    }
+  }
+
+  /**
+   * Request an upload slot from the HTTP Upload service (XEP-0363).
+   * @param filename - Name of the file to upload
+   * @param size - Size of the file in bytes
+   * @param contentType - MIME type of the file
+   * @returns Upload slot with PUT and GET URLs
+   */
+  async requestUploadSlot(filename: string, size: number, contentType: string): Promise<UploadSlot> {
+    if (!this.deps.getXmpp()) {
+      throw new Error('Not connected')
+    }
+
+    const service = this.deps.stores?.connection.getHttpUploadService?.()
+    if (!service) {
+      throw new Error('HTTP Upload service not available')
+    }
+
+    // Check file size limit
+    if (service.maxFileSize && size > service.maxFileSize) {
+      throw new Error(`File too large (max ${Math.round(service.maxFileSize / 1024 / 1024)}MB)`)
+    }
+
+    const iq = xml(
+      'iq',
+      { type: 'get', to: service.jid, id: `slot_${generateUUID()}` },
+      xml('request', {
+        xmlns: NS_HTTP_UPLOAD,
+        filename,
+        size: String(size),
+        'content-type': contentType,
+      })
+    )
+
+    try {
+      const result = await this.deps.sendIQ(iq)
+      const slot = result.getChild('slot', NS_HTTP_UPLOAD)
+      const put = slot?.getChild('put')
+      const get = slot?.getChild('get')
+
+      if (!put?.attrs.url || !get?.attrs.url) {
+        throw new Error('Invalid upload slot response')
+      }
+
+      // Extract headers from put element
+      const headers: Record<string, string> = {}
+      const headerElements = put.getChildren('header') || []
+      for (const h of headerElements) {
+        if (h.attrs.name) {
+          headers[h.attrs.name] = h.text() || ''
+        }
+      }
+
+      return {
+        putUrl: put.attrs.url,
+        getUrl: get.attrs.url,
+        headers: Object.keys(headers).length > 0 ? headers : undefined,
+      }
+    } catch (err) {
+      if (err instanceof Error) {
+        throw err
+      }
+      throw new Error('Failed to request upload slot')
+    }
+  }
+}

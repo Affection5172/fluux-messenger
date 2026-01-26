@@ -1,0 +1,159 @@
+import { useState, useEffect } from 'react'
+import { Routes, Route, Navigate } from 'react-router-dom'
+import { useConnection } from '@fluux/sdk'
+import { detectRenderLoop } from '@/utils/renderLoopDetector'
+import { LoginScreen } from './components/LoginScreen'
+import { ChatLayout } from './components/ChatLayout'
+import { UpdateModal } from './components/UpdateModal'
+import { useSessionPersistence, getSession } from './hooks/useSessionPersistence'
+import { useFullscreen } from './hooks/useFullscreen'
+import { useAutoUpdate } from './hooks'
+
+// Tauri detection
+const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+
+// macOS detection (for title bar overlay - only applies on macOS)
+const isMacOS = typeof navigator !== 'undefined' && /Mac/.test(navigator.platform)
+
+// Fixed title bar height for macOS traffic lights (only used in Tauri on macOS)
+const TITLEBAR_HEIGHT = 28
+
+function TitleBar() {
+  const isFullscreen = useFullscreen()
+
+  // Only render on macOS in Tauri (for traffic light spacing)
+  // Windows and Linux use native title bars
+  if (!isTauri || !isMacOS || isFullscreen) return null
+
+  return (
+    <div
+      data-tauri-drag-region
+      className="fixed top-0 left-0 right-0 bg-transparent"
+      style={{ height: TITLEBAR_HEIGHT, zIndex: 9999 }}
+    />
+  )
+}
+
+function App() {
+  // Detect render loops before they freeze the UI
+  detectRenderLoop('App')
+
+  const { status } = useConnection()
+  const update = useAutoUpdate()
+
+  // Track if we've shown the update modal this session (don't show again after dismiss)
+  const [showUpdateModal, setShowUpdateModal] = useState(false)
+  const [updateDismissed, setUpdateDismissed] = useState(false)
+
+  // Show update modal when update is first detected (only once per session)
+  useEffect(() => {
+    if (update.available && !updateDismissed && !showUpdateModal) {
+      setShowUpdateModal(true)
+    }
+  }, [update.available, updateDismissed, showUpdateModal])
+
+  const handleUpdateDismiss = () => {
+    setShowUpdateModal(false)
+    setUpdateDismissed(true)
+    update.dismissUpdate()
+  }
+
+  // Track if we're attempting auto-reconnect from saved session
+  // This prevents flashing LoginScreen on page reload
+  const [isAutoReconnecting, setIsAutoReconnecting] = useState(() => {
+    // Check synchronously on first render if we have a saved session
+    return getSession() !== null
+  })
+
+  // Auto-reconnect on page reload if session exists
+  useSessionPersistence()
+
+  // Clear auto-reconnecting flag once we're online or if we fail to connect
+  useEffect(() => {
+    if (status === 'online') {
+      setIsAutoReconnecting(false)
+    } else if (status === 'error' || status === 'disconnected') {
+      // If we get an error or stay disconnected, check if session still exists
+      // (it's cleared on connection failure in useSessionPersistence)
+      const hasSession = getSession() !== null
+      if (!hasSession) {
+        setIsAutoReconnecting(false)
+      }
+    }
+  }, [status])
+
+  // Check if we have a stored session (for reconnect scenarios)
+  const hasSession = getSession() !== null
+
+  // Show loading state during auto-reconnect attempt (prevents login flash on reload)
+  // Also show spinner when connecting with a stored session (reconnect after being online)
+  if ((isAutoReconnecting || hasSession) && (status === 'disconnected' || status === 'connecting')) {
+    return (
+      <>
+        <TitleBar />
+        <div className="flex h-screen items-center justify-center bg-fluux-bg">
+          <div className="text-center">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-fluux-brand mx-auto mb-4" />
+            <p className="text-fluux-muted">Reconnecting...</p>
+          </div>
+        </div>
+      </>
+    )
+  }
+
+  // Show login if disconnected, connecting, or error (to display error message)
+  // Only show login if we don't have a stored session
+  if ((status === 'disconnected' || status === 'connecting' || status === 'error') && !hasSession) {
+    return (
+      <>
+        <TitleBar />
+        <LoginScreen />
+      </>
+    )
+  }
+
+  // Show login on error even with session (to display error message and allow retry)
+  if (status === 'error') {
+    return (
+      <>
+        <TitleBar />
+        <LoginScreen />
+      </>
+    )
+  }
+
+  // Show main chat interface when online or reconnecting
+  // Routes are defined but ChatLayout still handles view logic internally (Phase 1)
+  // Phase 2 will migrate view selection to route-based rendering
+  return (
+    <>
+      <TitleBar />
+      <Routes>
+        {/* Phase 1: All routes render ChatLayout, which handles view internally */}
+        {/* Phase 2 will move view selection logic to route components */}
+        <Route path="/messages/:jid?" element={<ChatLayout />} />
+        <Route path="/rooms/:jid?" element={<ChatLayout />} />
+        <Route path="/contacts/:jid?" element={<ChatLayout />} />
+        <Route path="/archive/:jid?" element={<ChatLayout />} />
+        <Route path="/events" element={<ChatLayout />} />
+        <Route path="/admin/*" element={<ChatLayout />} />
+        <Route path="/settings/:category?" element={<ChatLayout />} />
+        {/* Default redirect to messages */}
+        <Route path="/" element={<Navigate to="/messages" replace />} />
+        {/* Catch-all for unknown routes */}
+        <Route path="*" element={<Navigate to="/messages" replace />} />
+      </Routes>
+      {/* Update modal - shown on app launch when update is available */}
+      {showUpdateModal && update.available && (
+        <UpdateModal
+          state={update}
+          onDownload={update.downloadAndInstall}
+          onRelaunch={update.relaunchApp}
+          onDismiss={handleUpdateDismiss}
+        />
+      )}
+    </>
+  )
+}
+
+export default App

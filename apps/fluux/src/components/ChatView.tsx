@@ -1,0 +1,795 @@
+import React, { useState, useRef, useEffect, useMemo, useCallback, memo, type RefObject } from 'react'
+import { useTranslation } from 'react-i18next'
+import { useChat, useRoster, usePresence, createMessageLookup, type Message, type Contact } from '@fluux/sdk'
+import { useConnectionStore } from '@fluux/sdk/react'
+import { getTranslatedStatusText } from '@/utils/statusText'
+import { getConsistentTextColor } from './Avatar'
+import { useFileUpload, useLinkPreview, useTypeToFocus, useMessageCopy, useMode, useMessageSelection, useDragAndDrop, useConversationDraft } from '@/hooks'
+import { getTranslatedShowText } from '@/utils/presence'
+import { Upload, Loader2 } from 'lucide-react'
+import { MessageBubble, MessageList as MessageListComponent, shouldShowAvatar, buildReplyContext } from './conversation'
+import { ChristmasAnimation } from './ChristmasAnimation'
+import { ChatHeader } from './ChatHeader'
+import { MessageComposer, type ReplyInfo, type EditInfo, type MessageComposerHandle } from './MessageComposer'
+import { findLastEditableMessage, findLastEditableMessageId } from '@/utils/messageUtils'
+
+interface ChatViewProps {
+  onBack?: () => void
+  onSwitchToMessages?: (conversationId: string) => void
+  // Focus zone refs for Tab cycling
+  mainContentRef?: RefObject<HTMLElement>
+  composerRef?: RefObject<HTMLElement>
+}
+
+export function ChatView({ onBack, onSwitchToMessages, mainContentRef, composerRef }: ChatViewProps) {
+  const { t } = useTranslation()
+  const { activeConversation, activeMessages, activeTypingUsers, sendMessage, sendReaction, sendCorrection, retractMessage, activeAnimation, sendEasterEgg, clearAnimation, clearFirstNewMessageId, activeMAMState, fetchOlderHistory } = useChat()
+  const { contacts } = useRoster()
+  // NOTE: Use focused selectors instead of useConnection() hook to avoid
+  // re-renders when unrelated connection state changes (error, reconnectAttempt, etc.)
+  const jid = useConnectionStore((s) => s.jid)
+  const ownAvatar = useConnectionStore((s) => s.ownAvatar)
+  const ownNickname = useConnectionStore((s) => s.ownNickname)
+  const status = useConnectionStore((s) => s.status)
+  const isConnected = status === 'online'
+  const { presenceStatus: presenceShow } = usePresence()
+  const { uploadFile, isUploading, progress, isSupported } = useFileUpload()
+  const { processMessageForLinkPreview } = useLinkPreview()
+  const { resolvedMode } = useMode()
+  const myBareJid = jid?.split('/')[0]
+
+  // Reply state - which message are we replying to
+  const [replyingTo, setReplyingTo] = useState<Message | null>(null)
+
+  // Edit state - which message are we editing
+  const [editingMessage, setEditingMessage] = useState<Message | null>(null)
+
+
+  // Find the last outgoing message ID for edit button visibility (skip retracted)
+  const lastOutgoingMessageId = useMemo(
+    () => findLastEditableMessageId(activeMessages),
+    [activeMessages]
+  )
+
+  // Last message ID - reply button is disabled for last message (context is already clear)
+  const lastMessageId = activeMessages.length > 0 ? activeMessages[activeMessages.length - 1].id : null
+
+  // Handler to edit the last outgoing message (triggered by Up arrow in empty composer)
+  const handleEditLastMessage = useCallback(() => {
+    const msg = findLastEditableMessage(activeMessages)
+    if (msg) {
+      setEditingMessage(msg)
+    }
+  }, [activeMessages])
+
+  // Composing state - hides message toolbars when user is typing
+  const [isComposing, setIsComposing] = useState(false)
+
+  // Track which message has reaction picker open (hides other toolbars)
+  const [activeReactionPickerMessageId, setActiveReactionPickerMessageId] = useState<string | null>(null)
+
+  // Composer handle ref for type-to-focus (separate from focus zone ref)
+  const composerHandleRef = useRef<MessageComposerHandle>(null)
+
+  // Type-to-focus: auto-focus composer when user starts typing anywhere
+  useTypeToFocus(composerHandleRef)
+
+  // Scroll ref for programmatic scrolling and keyboard navigation
+  const scrollRef = useRef<HTMLElement>(null)
+  const isAtBottomRef = useRef(true)
+
+  // Scroll to bottom (used after sending a message)
+  const scrollToBottom = useCallback(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTo({
+        top: scrollRef.current.scrollHeight,
+        behavior: 'smooth',
+      })
+    }
+  }, [])
+
+  // Scroll to bottom when media loads (images, videos, link previews)
+  // Only scrolls if user was already at bottom to avoid disrupting scroll position
+  const handleMediaLoad = useCallback(() => {
+    if (scrollRef.current && isAtBottomRef.current) {
+      // Use instant scroll to avoid jarring animation when content expands
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+    }
+  }, [])
+
+  // Scroll to bottom when composer resizes (typing long message)
+  // Only scrolls if user was already at bottom to avoid disrupting scroll position
+  const handleInputResize = useCallback(() => {
+    if (scrollRef.current && isAtBottomRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+    }
+  }, [])
+
+  // Keyboard navigation for message selection
+  const {
+    selectedMessageId,
+    hasKeyboardSelection,
+    showToolbarForSelection,
+    handleKeyDown: handleMessageListKeyDown,
+    clearSelection,
+    handleMouseMove,
+    handleMouseLeave,
+  } = useMessageSelection(activeMessages, scrollRef, isAtBottomRef, {
+    onReachedFirstMessage: fetchOlderHistory,
+    isLoadingOlder: activeMAMState?.isLoading,
+    isHistoryComplete: activeMAMState?.isHistoryComplete,
+  })
+
+  // Format copied messages with sender headers
+  useMessageCopy(scrollRef)
+
+  // Create a lookup map for contacts by JID
+  const contactsByJid = useMemo(() => {
+    const map = new Map<string, Contact>()
+    contacts.forEach(c => map.set(c.jid, c))
+    return map
+  }, [contacts])
+
+  // Create a lookup map for messages by ID (for reply context)
+  // Index by both client id and stanza-id since replies may reference either
+  const messagesById = useMemo(() => createMessageLookup(activeMessages), [activeMessages])
+
+  // Clear reply/edit state when conversation changes
+  // Note: scroll position is managed by MessageList component
+  useEffect(() => {
+    setReplyingTo(null)
+    setEditingMessage(null)
+    clearSelection()
+  }, [activeConversation?.id, clearSelection])
+
+  // XEP-0313: Message history is now auto-fetched by the SDK (useChat hook)
+  // - Cache is loaded immediately when conversation becomes active
+  // - MAM query runs in background when connected
+  // - No manual orchestration needed here
+
+  // File upload handler for drag-drop
+  const handleFileDrop = useCallback(async (file: File) => {
+    if (!activeConversation || !isSupported) return
+    const attachment = await uploadFile(file)
+    if (attachment) {
+      await sendMessage(activeConversation.id, attachment.url, activeConversation.type, undefined, attachment)
+      scrollToBottom()
+    }
+  }, [activeConversation, isSupported, uploadFile, sendMessage, scrollToBottom])
+
+  // Drag-and-drop for file upload (handles both HTML5 and Tauri native)
+  const { isDragging, dragHandlers } = useDragAndDrop({
+    onFileDrop: handleFileDrop,
+    isUploadSupported: isSupported,
+  })
+
+  // Handle reply button click - set reply state and focus composer
+  const handleReply = useCallback((message: Message) => {
+    setReplyingTo(message)
+    // Focus composer so user can start typing immediately
+    setTimeout(() => composerHandleRef.current?.focus(), 0)
+  }, [])
+
+  // Memoize the clearFirstNewMessageId callback to avoid render loops
+  // (inline arrow functions create new references on every render)
+  const handleClearFirstNewMessageId = useCallback(() => {
+    if (activeConversation) {
+      clearFirstNewMessageId(activeConversation.id)
+    }
+  }, [activeConversation?.id, clearFirstNewMessageId])
+
+  if (!activeConversation) return null
+
+  // Get contact for 1:1 chats
+  const contact = activeConversation.type === 'chat'
+    ? contactsByJid.get(activeConversation.id)
+    : undefined
+
+  return (
+    <div
+      className="flex flex-col h-full min-h-0 relative"
+      {...dragHandlers}
+    >
+      {/* Drop zone overlay */}
+      {isDragging && (
+        <div className="absolute inset-0 z-50 bg-fluux-bg/95 backdrop-blur-sm flex items-center justify-center pointer-events-none">
+          <div className="flex flex-col items-center gap-4 p-8 border-2 border-dashed border-fluux-brand rounded-xl bg-fluux-bg/50">
+            <Upload className="w-12 h-12 text-fluux-brand" />
+            <p className="text-lg font-medium text-fluux-text">{t('upload.dropToUpload')}</p>
+          </div>
+        </div>
+      )}
+
+      {/* Header */}
+      <ChatHeader
+        name={activeConversation.name}
+        type={activeConversation.type}
+        contact={contact}
+        jid={activeConversation.id}
+        onBack={onBack}
+      />
+
+      {/* Messages - focusable zone for Tab cycling */}
+      <div
+        ref={mainContentRef as React.RefObject<HTMLDivElement>}
+        tabIndex={0}
+        className="focus-zone flex-1 flex flex-col min-h-0 p-1"
+        onKeyDown={handleMessageListKeyDown}
+        onMouseMove={(e) => {
+          // Find which message is being hovered (for keyboard nav starting point)
+          const messageEl = (e.target as HTMLElement).closest('[data-message-id]')
+          const messageId = messageEl?.getAttribute('data-message-id') || undefined
+          handleMouseMove(e, messageId)
+        }}
+        onMouseLeave={handleMouseLeave}
+      >
+        <ChatMessageList
+          messages={activeMessages}
+          contactsByJid={contactsByJid}
+          messagesById={messagesById}
+          typingUsers={activeTypingUsers}
+          scrollerRef={scrollRef}
+          isAtBottomRef={isAtBottomRef}
+          conversationId={activeConversation.id}
+          conversationType={activeConversation.type}
+          sendReaction={sendReaction}
+          myBareJid={myBareJid}
+          ownAvatar={ownAvatar}
+          ownNickname={ownNickname}
+          ownPresence={presenceShow}
+          onReply={handleReply}
+          onEdit={setEditingMessage}
+          lastOutgoingMessageId={lastOutgoingMessageId}
+          lastMessageId={lastMessageId}
+          isComposing={isComposing}
+          activeReactionPickerMessageId={activeReactionPickerMessageId}
+          onReactionPickerChange={(messageId, isOpen) => setActiveReactionPickerMessageId(isOpen ? messageId : null)}
+          retractMessage={retractMessage}
+          selectedMessageId={selectedMessageId}
+          hasKeyboardSelection={hasKeyboardSelection}
+          showToolbarForSelection={showToolbarForSelection}
+          firstNewMessageId={activeConversation.firstNewMessageId}
+          clearFirstNewMessageId={handleClearFirstNewMessageId}
+          isDarkMode={resolvedMode === 'dark'}
+          onMediaLoad={handleMediaLoad}
+          onScrollToTop={fetchOlderHistory}
+          isLoadingOlder={activeMAMState?.isLoading ?? false}
+          isHistoryComplete={activeMAMState?.isHistoryComplete ?? false}
+          // SDK auto-fetches cache + MAM in background, no blocking spinner needed
+          isInitialLoading={false}
+        />
+      </div>
+
+      {/* Input */}
+      <MessageInput
+        composerRef={composerHandleRef}
+        textareaRef={composerRef as React.RefObject<HTMLTextAreaElement>}
+        conversationId={activeConversation.id}
+        conversationName={activeConversation.name}
+        type={activeConversation.type}
+        onMessageSent={scrollToBottom}
+        onInputResize={handleInputResize}
+        replyingTo={replyingTo}
+        onCancelReply={() => setReplyingTo(null)}
+        editingMessage={editingMessage}
+        onCancelEdit={() => setEditingMessage(null)}
+        onEditLastMessage={handleEditLastMessage}
+        sendCorrection={sendCorrection}
+        retractMessage={retractMessage}
+        contactsByJid={contactsByJid}
+        onComposingChange={setIsComposing}
+        sendEasterEgg={sendEasterEgg}
+        uploadState={{ isUploading, progress }}
+        isUploadSupported={isSupported}
+        onFileSelect={handleFileDrop}
+        processLinkPreview={processMessageForLinkPreview}
+        isConnected={isConnected}
+        onSwitchToMessages={onSwitchToMessages}
+      />
+
+      {/* Easter egg animation */}
+      {activeAnimation?.conversationId === activeConversation.id && activeAnimation.animation === 'christmas' && (
+        <ChristmasAnimation onComplete={clearAnimation} />
+      )}
+    </div>
+  )
+}
+
+function ChatMessageList({
+  messages,
+  contactsByJid,
+  messagesById,
+  typingUsers,
+  scrollerRef,
+  isAtBottomRef,
+  conversationId,
+  conversationType,
+  sendReaction,
+  myBareJid,
+  ownAvatar,
+  ownNickname,
+  ownPresence,
+  onReply,
+  onEdit,
+  lastOutgoingMessageId,
+  lastMessageId,
+  isComposing,
+  activeReactionPickerMessageId,
+  onReactionPickerChange,
+  retractMessage,
+  selectedMessageId,
+  hasKeyboardSelection,
+  showToolbarForSelection,
+  firstNewMessageId,
+  clearFirstNewMessageId,
+  isDarkMode,
+  onMediaLoad,
+  onScrollToTop,
+  isLoadingOlder,
+  isHistoryComplete,
+  isInitialLoading,
+}: {
+  messages: Message[]
+  contactsByJid: Map<string, Contact>
+  messagesById: Map<string, Message>
+  typingUsers: string[]
+  scrollerRef: React.RefObject<HTMLElement>
+  isAtBottomRef: React.MutableRefObject<boolean>
+  conversationId: string
+  conversationType: 'chat' | 'groupchat'
+  sendReaction: (to: string, messageId: string, emojis: string[], type: 'chat' | 'groupchat') => Promise<void>
+  myBareJid?: string
+  ownAvatar?: string | null
+  ownNickname?: string | null
+  ownPresence?: 'online' | 'away' | 'dnd' | 'offline'
+  onReply: (message: Message) => void
+  onEdit: (message: Message) => void
+  lastOutgoingMessageId: string | null
+  lastMessageId: string | null
+  isComposing: boolean
+  activeReactionPickerMessageId: string | null
+  onReactionPickerChange: (messageId: string, isOpen: boolean) => void
+  retractMessage: (conversationId: string, messageId: string) => Promise<void>
+  selectedMessageId: string | null
+  hasKeyboardSelection: boolean
+  showToolbarForSelection: boolean
+  firstNewMessageId?: string
+  clearFirstNewMessageId: () => void
+  isDarkMode?: boolean
+  onMediaLoad?: () => void
+  onScrollToTop?: () => void
+  isLoadingOlder?: boolean
+  isHistoryComplete?: boolean
+  isInitialLoading?: boolean
+}) {
+  const { t } = useTranslation()
+
+  // Track which message is hovered for stable toolbar interaction
+  // This prevents the toolbar from switching when moving mouse to it
+  const [hoveredMessageId, setHoveredMessageId] = useState<string | null>(null)
+  const hoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Handle mouse enter on a message - set it as hovered immediately
+  const handleMessageHover = useCallback((messageId: string) => {
+    // Clear any pending timeout to clear hover
+    if (hoverTimeoutRef.current) {
+      clearTimeout(hoverTimeoutRef.current)
+      hoverTimeoutRef.current = null
+    }
+    setHoveredMessageId(messageId)
+  }, [])
+
+  // Handle mouse leave from a message - delay clearing to allow moving to toolbar
+  const handleMessageLeave = useCallback(() => {
+    // Clear any existing timeout
+    if (hoverTimeoutRef.current) {
+      clearTimeout(hoverTimeoutRef.current)
+    }
+    // Delay clearing hover to allow mouse to reach toolbar
+    hoverTimeoutRef.current = setTimeout(() => {
+      setHoveredMessageId(null)
+      hoverTimeoutRef.current = null
+    }, 100) // Small delay to allow mouse to reach toolbar
+  }, [])
+
+  // Clear hover when conversation changes
+  useEffect(() => {
+    setHoveredMessageId(null)
+  }, [conversationId])
+
+  // Cleanup timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (hoverTimeoutRef.current) {
+        clearTimeout(hoverTimeoutRef.current)
+      }
+    }
+  }, [])
+
+  return (
+    <MessageListComponent
+      messages={messages}
+      conversationId={conversationId}
+      firstNewMessageId={firstNewMessageId}
+      clearFirstNewMessageId={clearFirstNewMessageId}
+      scrollerRef={scrollerRef}
+      isAtBottomRef={isAtBottomRef}
+      typingUsers={typingUsers}
+      formatTypingUser={(jid) => {
+        const bareJid = jid.split('/')[0]
+        return contactsByJid.get(bareJid)?.name || bareJid.split('@')[0]
+      }}
+      renderMessage={(msg, idx, groupMessages) => (
+        <ChatMessageBubble
+          message={msg}
+          showAvatar={shouldShowAvatar(groupMessages, idx)}
+          avatar={msg.isOutgoing ? ownAvatar ?? undefined : contactsByJid.get(msg.from)?.avatar}
+          ownNickname={ownNickname}
+          ownPresence={ownPresence}
+          conversationId={conversationId}
+          conversationType={conversationType}
+          sendReaction={sendReaction}
+          myBareJid={myBareJid}
+          contactsByJid={contactsByJid}
+          messagesById={messagesById}
+          onReply={onReply}
+          onEdit={onEdit}
+          isLastOutgoing={msg.id === lastOutgoingMessageId}
+          isLastMessage={msg.id === lastMessageId}
+          hideToolbar={isComposing || (activeReactionPickerMessageId !== null && activeReactionPickerMessageId !== msg.id)}
+          onReactionPickerChange={(isOpen) => onReactionPickerChange(msg.id, isOpen)}
+          retractMessage={retractMessage}
+          isSelected={msg.id === selectedMessageId}
+          hasKeyboardSelection={hasKeyboardSelection}
+          showToolbarForSelection={showToolbarForSelection}
+          isDarkMode={isDarkMode}
+          onMediaLoad={onMediaLoad}
+          isHovered={hoveredMessageId === msg.id}
+          onMouseEnter={() => handleMessageHover(msg.id)}
+          onMouseLeave={handleMessageLeave}
+        />
+      )}
+      onScrollToTop={onScrollToTop}
+      isLoadingOlder={isLoadingOlder}
+      isHistoryComplete={isHistoryComplete}
+      isLoading={isInitialLoading}
+      loadingState={
+        <div className="flex-1 flex items-center justify-center text-fluux-muted">
+          <div className="flex items-center gap-2">
+            <Loader2 className="w-5 h-5 animate-spin" />
+            <span>{t('chat.loadingMessages')}</span>
+          </div>
+        </div>
+      }
+    />
+  )
+}
+
+interface ChatMessageBubbleProps {
+  message: Message
+  showAvatar: boolean
+  avatar?: string
+  ownNickname?: string | null
+  ownPresence?: 'online' | 'away' | 'dnd' | 'offline'
+  conversationId: string
+  conversationType: 'chat' | 'groupchat'
+  sendReaction: (to: string, messageId: string, emojis: string[], type: 'chat' | 'groupchat') => Promise<void>
+  myBareJid?: string
+  contactsByJid: Map<string, Contact>
+  messagesById: Map<string, Message>
+  onReply: (message: Message) => void
+  onEdit: (message: Message) => void
+  isLastOutgoing: boolean
+  isLastMessage: boolean
+  hideToolbar?: boolean
+  onReactionPickerChange?: (isOpen: boolean) => void
+  retractMessage: (conversationId: string, messageId: string) => Promise<void>
+  isSelected?: boolean
+  hasKeyboardSelection?: boolean
+  showToolbarForSelection?: boolean
+  isDarkMode?: boolean
+  onMediaLoad?: () => void
+  // Hover state for stable toolbar interaction
+  isHovered?: boolean
+  onMouseEnter?: () => void
+  onMouseLeave?: () => void
+}
+
+const ChatMessageBubble = memo(function ChatMessageBubble({
+  message,
+  showAvatar,
+  avatar,
+  ownNickname,
+  ownPresence,
+  conversationId,
+  conversationType,
+  sendReaction,
+  myBareJid,
+  contactsByJid,
+  messagesById,
+  onReply,
+  onEdit,
+  isLastOutgoing,
+  isLastMessage,
+  hideToolbar,
+  onReactionPickerChange,
+  retractMessage,
+  isSelected,
+  hasKeyboardSelection,
+  showToolbarForSelection,
+  isDarkMode,
+  onMediaLoad,
+  isHovered,
+  onMouseEnter,
+  onMouseLeave,
+}: ChatMessageBubbleProps) {
+  const { t } = useTranslation()
+
+  // Use display name from roster, fall back to JID username
+  // For outgoing messages, use own nickname if set
+  const senderContact = contactsByJid.get(message.from.split('/')[0])
+  const senderName = message.isOutgoing
+    ? (ownNickname || message.from.split('@')[0])
+    : (senderContact?.name || message.from.split('@')[0])
+
+  // Get sender color: green for own messages, contact's pre-calculated color, or fallback to generation
+  const senderColor = message.isOutgoing
+    ? 'var(--fluux-green)'
+    : senderContact
+      ? (isDarkMode ? senderContact.colorDark : senderContact.colorLight) || getConsistentTextColor(message.from.split('/')[0], isDarkMode)
+      : getConsistentTextColor(message.from.split('/')[0], isDarkMode)
+
+  // Get my current reactions to this message
+  const myReactions = useMemo(() => {
+    if (!message.reactions || !myBareJid) return []
+    return Object.entries(message.reactions)
+      .filter(([, reactors]) => reactors.includes(myBareJid))
+      .map(([emoji]) => emoji)
+  }, [message.reactions, myBareJid])
+
+  // Handle reaction toggle
+  const handleReaction = useCallback((emoji: string) => {
+    if (!myBareJid) return
+
+    const newReactions = myReactions.includes(emoji)
+      ? myReactions.filter(e => e !== emoji)
+      : [...myReactions, emoji]
+
+    void sendReaction(conversationId, message.id, newReactions, conversationType)
+  }, [myBareJid, myReactions, sendReaction, conversationId, message.id, conversationType])
+
+  // Build reply context using shared helper
+  const replyContext = useMemo(() => buildReplyContext(
+    message,
+    messagesById,
+    (originalMsg, fallbackId) => {
+      if (originalMsg) {
+        return contactsByJid.get(originalMsg.from.split('/')[0])?.name || originalMsg.from.split('@')[0]
+      }
+      return fallbackId ? fallbackId.split('@')[0] : 'Unknown'
+    },
+    (originalMsg, fallbackId, dark) => {
+      const senderId = originalMsg?.from.split('/')[0] || fallbackId?.split('/')[0]
+      if (!senderId) return 'var(--fluux-brand)'
+      const contact = contactsByJid.get(senderId)
+      if (contact) {
+        return (dark ? contact.colorDark : contact.colorLight) || getConsistentTextColor(senderId, dark)
+      }
+      return getConsistentTextColor(senderId, dark)
+    },
+    isDarkMode
+  ), [message, messagesById, contactsByJid, isDarkMode])
+
+  // Get reactor display name
+  const getReactorName = useCallback((jid: string) => {
+    if (jid === myBareJid) return 'You'
+    return contactsByJid.get(jid)?.name || jid.split('@')[0]
+  }, [myBareJid, contactsByJid])
+
+  return (
+    <MessageBubble
+      message={message}
+      showAvatar={showAvatar}
+      isSelected={isSelected}
+      hasKeyboardSelection={hasKeyboardSelection}
+      showToolbarForSelection={showToolbarForSelection}
+      hideToolbar={hideToolbar}
+      isLastOutgoing={isLastOutgoing}
+      isLastMessage={isLastMessage}
+      isDarkMode={isDarkMode}
+      isHovered={isHovered}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+      senderName={senderName}
+      senderColor={senderColor}
+      avatarUrl={avatar}
+      avatarIdentifier={message.from}
+      avatarFallbackColor={senderColor}
+      avatarPresence={message.isOutgoing ? ownPresence : senderContact?.presence}
+      avatarTooltip={getContactDevicesTooltip(senderContact, t)}
+      myReactions={myReactions}
+      onReaction={handleReaction}
+      getReactorName={getReactorName}
+      onReply={() => onReply(message)}
+      onEdit={() => onEdit(message)}
+      onDelete={async () => retractMessage(conversationId, message.id)}
+      onMediaLoad={onMediaLoad}
+      replyContext={replyContext}
+      onReactionPickerChange={onReactionPickerChange}
+    />
+  )
+})
+
+function MessageInput({
+  composerRef,
+  textareaRef,
+  conversationId,
+  conversationName,
+  type,
+  onMessageSent,
+  onInputResize,
+  replyingTo,
+  onCancelReply,
+  editingMessage,
+  onCancelEdit,
+  sendCorrection,
+  retractMessage,
+  contactsByJid,
+  onComposingChange,
+  sendEasterEgg,
+  isConnected,
+  onEditLastMessage,
+  uploadState,
+  isUploadSupported,
+  onFileSelect,
+  processLinkPreview,
+  onSwitchToMessages,
+}: {
+  composerRef: React.RefObject<MessageComposerHandle>
+  textareaRef?: React.RefObject<HTMLTextAreaElement>
+  conversationId: string
+  conversationName: string
+  type: 'chat' | 'groupchat'
+  onMessageSent?: () => void
+  onInputResize?: () => void
+  replyingTo: Message | null
+  onCancelReply: () => void
+  editingMessage: Message | null
+  onCancelEdit: () => void
+  sendCorrection: (conversationId: string, messageId: string, newBody: string, attachment?: import('@fluux/sdk').FileAttachment) => Promise<void>
+  retractMessage: (conversationId: string, messageId: string) => Promise<void>
+  contactsByJid: Map<string, Contact>
+  onComposingChange?: (isComposing: boolean) => void
+  sendEasterEgg: (to: string, type: 'chat' | 'groupchat', animation: string) => Promise<void>
+  isConnected: boolean
+  onEditLastMessage?: () => void
+  uploadState?: { isUploading: boolean; progress: number }
+  isUploadSupported?: boolean
+  onFileSelect?: (file: File) => void
+  processLinkPreview?: (messageId: string, body: string, to: string, type: 'chat' | 'groupchat') => Promise<void>
+  onSwitchToMessages?: (conversationId: string) => void
+}) {
+  const { t } = useTranslation()
+  const { sendMessage, sendChatState, isArchived, unarchiveConversation, setDraft, getDraft, clearDraft, clearFirstNewMessageId } = useChat()
+
+  // Draft persistence - saves on conversation change, restores on load
+  const [text, setText] = useConversationDraft({
+    conversationId,
+    draftOperations: { getDraft, setDraft, clearDraft },
+    composerRef,
+  })
+
+  // Convert Message to ReplyInfo for the composer
+  // Use stanzaId (XEP-0359) if available - this is what other clients may use to look up the referenced message
+  const replyInfo: ReplyInfo | null = replyingTo
+    ? {
+        id: replyingTo.stanzaId || replyingTo.id,
+        from: replyingTo.from,
+        senderName: contactsByJid.get(replyingTo.from.split('/')[0])?.name || replyingTo.from.split('@')[0],
+        body: replyingTo.body,
+      }
+    : null
+
+  // Convert Message to EditInfo for the composer
+  const editInfo: EditInfo | null = editingMessage
+    ? {
+        id: editingMessage.id,
+        body: editingMessage.body,
+        attachment: editingMessage.attachment,
+      }
+    : null
+
+  const handleCorrection = async (messageId: string, newBody: string, attachment?: import('@fluux/sdk').FileAttachment): Promise<boolean> => {
+    await sendCorrection(conversationId, messageId, newBody, attachment)
+    return true
+  }
+
+  const handleRetract = async (messageId: string): Promise<void> => {
+    await retractMessage(conversationId, messageId)
+  }
+
+  const handleSend = async (text: string): Promise<boolean> => {
+    // Unarchive conversation if archived (user is actively chatting)
+    // and switch to Messages view to see it in the main list
+    if (type === 'chat' && isArchived(conversationId)) {
+      unarchiveConversation(conversationId)
+      onSwitchToMessages?.(conversationId)
+    }
+
+    // Include reply info if replying to a message (with XEP-0428 fallback for compatibility)
+    // Use stanzaId (XEP-0359) if available - this is what other clients may use to look up the referenced message
+    let replyTo: { id: string; to: string; fallback?: { author: string; body: string } } | undefined
+    if (replyingTo) {
+      const authorName = contactsByJid.get(replyingTo.from.split('/')[0])?.name || replyingTo.from.split('@')[0]
+      replyTo = {
+        id: replyingTo.stanzaId || replyingTo.id,
+        to: replyingTo.from,
+        fallback: { author: authorName, body: replyingTo.body }
+      }
+    }
+    const messageId = await sendMessage(conversationId, text, type, replyTo)
+
+    // Clear draft immediately so sidebar updates
+    clearDraft(conversationId)
+
+    // Process link preview in background (don't block on it)
+    if (processLinkPreview) {
+      processLinkPreview(messageId, text, conversationId, type).catch(console.error)
+    }
+
+    // Scroll to bottom to show the sent message
+    onMessageSent?.()
+
+    // Clear the "new messages" marker after a short delay (user is actively engaged)
+    setTimeout(() => clearFirstNewMessageId(conversationId), 500)
+
+    return true
+  }
+
+  const handleTypingState = (state: 'composing' | 'paused') => {
+    void sendChatState(conversationId, state, type)
+  }
+
+  return (
+    <MessageComposer
+      ref={composerRef}
+      textareaRef={textareaRef}
+      placeholder={t('chat.messageTo', { name: conversationName })}
+      replyingTo={replyInfo}
+      onCancelReply={onCancelReply}
+      editingMessage={editInfo}
+      onCancelEdit={onCancelEdit}
+      onSendCorrection={handleCorrection}
+      onRetractMessage={handleRetract}
+      onComposingChange={onComposingChange}
+      onInputResize={onInputResize}
+      onSend={handleSend}
+      onSendEasterEgg={(animation) => sendEasterEgg(conversationId, type, animation)}
+      onSendTypingState={handleTypingState}
+      typingNotificationsEnabled={true}
+      onFileSelect={onFileSelect}
+      uploadState={uploadState}
+      isUploadSupported={isUploadSupported}
+      disabled={!isConnected}
+      value={text}
+      onValueChange={setText}
+      onEditLastMessage={onEditLastMessage}
+    />
+  )
+}
+
+// Generate tooltip text for contact's connected devices
+ 
+function getContactDevicesTooltip(contact: Contact | undefined, t?: any): string | undefined {
+  if (!contact?.resources || contact.resources.size === 0) {
+    return contact && t ? getTranslatedStatusText(contact, t) : undefined
+  }
+
+  const lines: string[] = []
+  for (const [resource, presence] of contact.resources.entries()) {
+    const clientName = presence.client || resource || (t ? t('contacts.unknown') : 'Unknown')
+    const status = t ? getTranslatedShowText(presence.show, t) : presence.show || 'online'
+    lines.push(`${clientName}: ${status}`)
+  }
+  return lines.join('\n')
+}

@@ -1,0 +1,84 @@
+import { format } from 'date-fns'
+
+/**
+ * Check if message is a /me action message (IRC-style action).
+ * Used to display timestamps instead of avatars for action messages.
+ */
+export function isActionMessage(body: string | undefined): boolean {
+  return body?.startsWith('/me ') ?? false
+}
+
+/**
+ * Base message interface for grouping (works with both Message and RoomMessage)
+ */
+interface GroupableMessage {
+  id: string
+  timestamp: Date
+  from: string
+}
+
+/**
+ * A group of messages that occurred on the same date
+ */
+export interface MessageGroup<T extends GroupableMessage> {
+  /** Date string in yyyy-MM-dd format */
+  date: string
+  /** Messages from this date */
+  messages: T[]
+}
+
+/**
+ * Groups messages by their date (yyyy-MM-dd format).
+ * Messages are assumed to be in chronological order.
+ */
+export function groupMessagesByDate<T extends GroupableMessage>(messages: T[]): MessageGroup<T>[] {
+  const groups: MessageGroup<T>[] = []
+
+  for (const msg of messages) {
+    const dateStr = format(msg.timestamp, 'yyyy-MM-dd')
+    const lastGroup = groups[groups.length - 1]
+
+    if (lastGroup?.date === dateStr) {
+      lastGroup.messages.push(msg)
+    } else {
+      groups.push({ date: dateStr, messages: [msg] })
+    }
+  }
+
+  return groups
+}
+
+/**
+ * Determines if a message should show its avatar based on:
+ * - First message always shows avatar
+ * - Different sender from previous message
+ * - More than 5 minutes gap from previous message
+ */
+export function shouldShowAvatar<T extends GroupableMessage>(messages: T[], index: number): boolean {
+  if (index === 0) return true
+
+  const current = messages[index]
+  const previous = messages[index - 1]
+
+  // Show avatar if different sender
+  if (current.from !== previous.from) return true
+
+  // Show avatar if more than 5 minutes apart
+  const timeDiff = current.timestamp.getTime() - previous.timestamp.getTime()
+  return timeDiff > 5 * 60 * 1000
+}
+
+/**
+ * Scrolls to a message element and highlights it temporarily.
+ * Used when clicking on reply context to jump to the original message.
+ *
+ * @param messageId - The ID of the message to scroll to (matches data-message-id attribute)
+ */
+export function scrollToMessage(messageId: string): void {
+  const element = document.querySelector(`[data-message-id="${messageId}"]`)
+  if (element) {
+    element.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    element.classList.add('message-highlight')
+    setTimeout(() => element.classList.remove('message-highlight'), 1500)
+  }
+}

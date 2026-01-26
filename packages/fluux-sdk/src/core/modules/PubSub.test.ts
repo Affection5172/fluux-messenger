@@ -1,0 +1,249 @@
+/**
+ * PubSub Module Tests
+ *
+ * Tests for XEP-0060 PubSub event handling.
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { XMPPClient } from '../XMPPClient'
+import {
+  createMockXmppClient,
+  createMockStores,
+  createMockElement,
+  type MockXmppClient,
+  type MockStoreBindings,
+} from '../test-utils'
+
+let mockXmppClientInstance: MockXmppClient
+
+// Use vi.hoisted to create the mock factory at hoist time
+const { mockClientFactory, mockXmlFn } = vi.hoisted(() => {
+  let clientInstance: MockXmppClient | null = null
+  return {
+    mockClientFactory: Object.assign(
+      vi.fn(() => clientInstance),
+      {
+        _setInstance: (instance: MockXmppClient) => { clientInstance = instance },
+      }
+    ),
+    mockXmlFn: vi.fn((name: string, attrs?: Record<string, string>, ...children: unknown[]) => ({
+      name,
+      attrs: attrs || {},
+      children,
+      toString: () => `<${name}/>`,
+    })),
+  }
+})
+
+// Mock @xmpp/client module
+vi.mock('@xmpp/client', () => ({
+  client: mockClientFactory,
+  xml: mockXmlFn,
+}))
+
+// Mock @xmpp/debug
+vi.mock('@xmpp/debug', () => ({
+  default: vi.fn(),
+}))
+
+describe('PubSub Module', () => {
+  let xmppClient: XMPPClient
+  let mockStores: MockStoreBindings
+  let emitSDKSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    mockXmppClientInstance = createMockXmppClient()
+    mockClientFactory.mockClear()
+    mockClientFactory._setInstance(mockXmppClientInstance)
+
+    mockStores = createMockStores()
+    xmppClient = new XMPPClient({ debug: false })
+    xmppClient.bindStores(mockStores)
+    emitSDKSpy = vi.spyOn(xmppClient, 'emitSDK')
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.clearAllMocks()
+  })
+
+  async function connectClient() {
+    const connectPromise = xmppClient.connect({
+      jid: 'user@example.com',
+      password: 'secret',
+      server: 'example.com',
+      skipDiscovery: true,
+    })
+    mockXmppClientInstance._emit('online')
+    await connectPromise
+  }
+
+  describe('avatar metadata (XEP-0084)', () => {
+    it('should emit avatarMetadataUpdate when receiving avatar metadata notification', async () => {
+      await connectClient()
+
+      const emitSpy = vi.spyOn(xmppClient as any, 'emit')
+
+      const pubsubMessage = createMockElement('message', {
+        from: 'contact@example.com',
+        to: 'user@example.com',
+      }, [
+        {
+          name: 'event',
+          attrs: { xmlns: 'http://jabber.org/protocol/pubsub#event' },
+          children: [
+            {
+              name: 'items',
+              attrs: { node: 'urn:xmpp:avatar:metadata' },
+              children: [
+                {
+                  name: 'item',
+                  children: [
+                    {
+                      name: 'metadata',
+                      attrs: { xmlns: 'urn:xmpp:avatar:metadata' },
+                      children: [
+                        {
+                          name: 'info',
+                          attrs: { id: 'abc123hash' },
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ])
+
+      mockXmppClientInstance._emit('stanza', pubsubMessage)
+
+      const avatarCalls = emitSpy.mock.calls.filter(call => call[0] === 'avatarMetadataUpdate')
+      expect(avatarCalls.length).toBe(1)
+      expect(avatarCalls[0]).toEqual(['avatarMetadataUpdate', 'contact@example.com', 'abc123hash'])
+    })
+
+    it('should emit avatarMetadataUpdate with null when avatar is removed', async () => {
+      await connectClient()
+
+      const emitSpy = vi.spyOn(xmppClient as any, 'emit')
+
+      // Avatar removed - item with no metadata child
+      const pubsubMessage = createMockElement('message', {
+        from: 'contact@example.com',
+        to: 'user@example.com',
+      }, [
+        {
+          name: 'event',
+          attrs: { xmlns: 'http://jabber.org/protocol/pubsub#event' },
+          children: [
+            {
+              name: 'items',
+              attrs: { node: 'urn:xmpp:avatar:metadata' },
+              children: [
+                {
+                  name: 'item',
+                  children: [], // Empty item = avatar removed
+                },
+              ],
+            },
+          ],
+        },
+      ])
+
+      mockXmppClientInstance._emit('stanza', pubsubMessage)
+
+      const avatarCalls = emitSpy.mock.calls.filter(call => call[0] === 'avatarMetadataUpdate')
+      expect(avatarCalls.length).toBe(1)
+      expect(avatarCalls[0]).toEqual(['avatarMetadataUpdate', 'contact@example.com', null])
+    })
+  })
+
+  describe('nickname updates (XEP-0172)', () => {
+    it('should update roster contact name when receiving nickname notification', async () => {
+      await connectClient()
+
+      const pubsubMessage = createMockElement('message', {
+        from: 'contact@example.com',
+        to: 'user@example.com',
+      }, [
+        {
+          name: 'event',
+          attrs: { xmlns: 'http://jabber.org/protocol/pubsub#event' },
+          children: [
+            {
+              name: 'items',
+              attrs: { node: 'http://jabber.org/protocol/nick' },
+              children: [
+                {
+                  name: 'item',
+                  children: [
+                    {
+                      name: 'nick',
+                      attrs: { xmlns: 'http://jabber.org/protocol/nick' },
+                      text: 'New Nickname',
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ])
+
+      mockXmppClientInstance._emit('stanza', pubsubMessage)
+
+      expect(emitSDKSpy).toHaveBeenCalledWith('roster:contact-updated', { jid: 'contact@example.com', updates: { name: 'New Nickname' } })
+    })
+  })
+
+  describe('stanza handling', () => {
+    it('should return true (handled) for PubSub event messages', async () => {
+      await connectClient()
+
+      const pubsubMessage = createMockElement('message', {
+        from: 'contact@example.com',
+      }, [
+        {
+          name: 'event',
+          attrs: { xmlns: 'http://jabber.org/protocol/pubsub#event' },
+          children: [
+            {
+              name: 'items',
+              attrs: { node: 'some:node' },
+              children: [],
+            },
+          ],
+        },
+      ])
+
+      const result = xmppClient.pubsub.handle(pubsubMessage)
+      expect(result).toBe(true)
+    })
+
+    it('should return false for non-PubSub messages', async () => {
+      await connectClient()
+
+      const regularMessage = createMockElement('message', {
+        from: 'contact@example.com',
+      }, [
+        { name: 'body', text: 'Hello' },
+      ])
+
+      const result = xmppClient.pubsub.handle(regularMessage)
+      expect(result).toBe(false)
+    })
+
+    it('should return false for presence stanzas', async () => {
+      await connectClient()
+
+      const presenceStanza = createMockElement('presence', {
+        from: 'contact@example.com',
+      }, [])
+
+      const result = xmppClient.pubsub.handle(presenceStanza)
+      expect(result).toBe(false)
+    })
+  })
+})

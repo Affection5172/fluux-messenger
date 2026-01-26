@@ -1,0 +1,30 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["./src/index.ts"],
+  "tsconfig": "./tsconfig.docs.json",
+  "out": "./docs",
+  "name": "Fluux SDK",
+  "readme": "./README.md",
+  "exclude": ["**/*.test.ts", "**/*.test.tsx", "**/test-utils.ts"],
+  "excludePrivate": true,
+  "excludeProtected": true,
+  "excludeInternal": true,
+  "includeVersion": true,
+  "categorizeByGroup": true,
+  "categoryOrder": [
+    "Provider",
+    "Hooks",
+    "Core",
+    "Types",
+    "Utilities",
+    "*"
+  ],
+  "navigationLinks": {
+    "GitHub": "https://github.com/processone/fluux-messenger"
+  },
+  "plugin": [],
+  "validation": {
+    "notExported": true,
+    "invalidLink": true
+  }
+}

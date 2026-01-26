@@ -1,0 +1,57 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+docs/
+*.tsbuildinfo
+
+# Tauri
+**/src-tauri/target/
+*.app
+*.dmg
+*.deb
+*.AppImage
+*.msi
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Testing
+coverage/
+
+# Security
+*.pem
+*.key
+
+# Private
+private/
+
+# Temporary files
+*.tmp
+*.temp
+.output.txt
+
+# AI Tools
+.claude/
+.copilot/
+.gemini/
+.aider/
+.cursor/
+.codeium/
