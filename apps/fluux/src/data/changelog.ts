@@ -29,6 +29,7 @@ export const changelog: ChangelogEntry[] = [
         type: 'changed',
         items: [
           'Message toolbar locks when emoji picker or menu is open',
+          'Event-based SDK infrastructure to make the app more reactive',
         ],
       },
       {
