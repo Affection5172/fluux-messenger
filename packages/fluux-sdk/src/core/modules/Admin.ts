@@ -329,23 +329,21 @@ export class Admin extends BaseModule {
       // Command may not be available
     }
 
-    // Try to fetch online MUC rooms count from MUC service
+    // Try to fetch online MUC rooms count using ejabberd API command
+    // Note: This is sent to the server domain (not MUC service) with api-commands/ prefix
     try {
-      const mucJid = this.deps.stores?.admin.getMucServiceJid?.()
-      if (mucJid) {
-        const roomsResult = await this.executeMucCommand(mucJid, 'muc_online_rooms_count')
-        if (roomsResult) {
-          // The field name varies - try common variations
-          const numField = getFormFieldValue(roomsResult, 'onlineroomsnum') ||
-                          getFormFieldValue(roomsResult, 'rooms') ||
-                          getFormFieldValue(roomsResult, 'count')
-          if (numField) {
-            counts.rooms = parseInt(numField, 10)
-          }
+      const roomsResult = await this.executeApiCommand('muc_online_rooms_count')
+      if (roomsResult) {
+        // The field name varies - try common variations
+        const numField = getFormFieldValue(roomsResult, 'onlineroomsnum') ||
+                        getFormFieldValue(roomsResult, 'rooms') ||
+                        getFormFieldValue(roomsResult, 'count')
+        if (numField) {
+          counts.rooms = parseInt(numField, 10)
         }
       }
     } catch {
-      // Command may not be available on MUC service
+      // Command may not be available
     }
 
     this.deps.emitSDK('admin:entity-counts', { counts })
@@ -385,16 +383,22 @@ export class Admin extends BaseModule {
   }
 
   /**
-   * Execute an ad-hoc command on a specific target (e.g., MUC service).
-   * @param targetJid - The JID to send the command to (e.g., conference.example.com)
+   * Execute an ejabberd API command (api-commands/ prefix).
+   * These are sent to the server domain, not a specific service.
    * @param commandName - The command name (e.g., muc_online_rooms_count)
    */
-  private async executeMucCommand(targetJid: string, commandName: string): Promise<DataForm | null> {
+  private async executeApiCommand(commandName: string): Promise<DataForm | null> {
+    const currentJid = this.deps.getCurrentJid()
+    if (!currentJid) return null
+
+    const domain = getDomain(currentJid)
+    const node = `api-commands/${commandName}`
+
     try {
       const iq = xml(
         'iq',
-        { type: 'set', to: targetJid, id: `muc_cmd_${generateUUID()}` },
-        xml('command', { xmlns: NS_COMMANDS, node: commandName, action: 'execute' })
+        { type: 'set', to: domain, id: `api_cmd_${generateUUID()}` },
+        xml('command', { xmlns: NS_COMMANDS, node, action: 'execute' })
       )
 
       const result = await this.deps.sendIQ(iq)
