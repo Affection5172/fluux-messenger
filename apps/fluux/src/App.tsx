@@ -58,20 +58,25 @@ function App() {
     update.dismissUpdate()
   }
 
-  // Track if we're attempting auto-reconnect from saved session
+  // Track if we're attempting auto-reconnect from saved session on page load
   // This prevents flashing LoginScreen on page reload
   const [isAutoReconnecting, setIsAutoReconnecting] = useState(() => {
     // Check synchronously on first render if we have a saved session
     return getSession() !== null
   })
 
+  // Track if we've ever been online this session
+  // Used to distinguish initial page load reconnect from wake-from-sleep reconnect
+  const [hasBeenOnline, setHasBeenOnline] = useState(false)
+
   // Auto-reconnect on page reload if session exists
   useSessionPersistence()
 
-  // Clear auto-reconnecting flag once we're online or if we fail to connect
+  // Track when we first come online, and clear auto-reconnecting flag
   useEffect(() => {
     if (status === 'online') {
       setIsAutoReconnecting(false)
+      setHasBeenOnline(true)
     } else if (status === 'error' || status === 'disconnected') {
       // If we get an error or stay disconnected, check if session still exists
       // (it's cleared on connection failure in useSessionPersistence)
@@ -85,9 +90,10 @@ function App() {
   // Check if we have a stored session (for reconnect scenarios)
   const hasSession = getSession() !== null
 
-  // Show loading state during auto-reconnect attempt (prevents login flash on reload)
-  // Also show spinner when connecting with a stored session (reconnect after being online)
-  if ((isAutoReconnecting || hasSession) && (status === 'disconnected' || status === 'connecting')) {
+  // Show loading state during initial auto-reconnect attempt (prevents login flash on reload)
+  // Only show for initial page load reconnect, NOT for wake-from-sleep reconnect.
+  // Once we've been online, stay in ChatLayout and show inline reconnect indicator.
+  if (isAutoReconnecting && !hasBeenOnline && (status === 'disconnected' || status === 'connecting')) {
     return (
       <>
         <TitleBar />
