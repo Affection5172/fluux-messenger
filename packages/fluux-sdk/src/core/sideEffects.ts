@@ -229,8 +229,7 @@ export function setupChatSideEffects(
  *
  * Subscribes to `activeRoomJid` changes and:
  * 1. Loads messages from IndexedDB cache immediately
- *
- * Note: Room history comes from the MUC join process, so no MAM fetch needed here.
+ * 2. Triggers background MAM fetch for catchup when connected and room supports MAM
  *
  * @param client - The XMPPClient instance
  * @param options - Configuration options
@@ -242,21 +241,88 @@ export function setupRoomSideEffects(
 ): () => void {
   const { debug = false } = options
 
-  // Track which rooms we've loaded cache for
-  const cacheLoaded = new Set<string>()
+  // Track whether we've initiated a fetch for each room
+  const fetchInitiated = new Set<string>()
 
-  // Note: We don't need the client for room side effects currently,
-  // but keeping it in the signature for consistency and future use
-  void client
+  /**
+   * Triggers MAM fetch for the active room if needed (catchup).
+   * Uses `start` filter to get messages AFTER the newest cached message.
+   */
+  async function fetchMAMForRoom(roomJid: string): Promise<void> {
+    const room = roomStore.getState().rooms.get(roomJid)
+    if (!room) {
+      return
+    }
+
+    // Skip Quick Chat rooms (transient, no MAM)
+    if (room.isQuickChat) {
+      if (debug) console.log('[SideEffects] Room: Skipping MAM for Quick Chat')
+      return
+    }
+
+    // Check if room supports MAM
+    if (!room.supportsMAM) {
+      if (debug) console.log('[SideEffects] Room: MAM not supported for', roomJid)
+      return
+    }
+
+    // Check connection
+    const connectionStatus = connectionStore.getState().status
+    if (connectionStatus !== 'online') {
+      if (debug) console.log('[SideEffects] Room: Skipping MAM (status:', connectionStatus, ')')
+      return
+    }
+
+    const mamState = roomStore.getState().getRoomMAMQueryState(roomJid)
+    if (mamState.isLoading) {
+      if (debug) console.log('[SideEffects] Room: MAM already loading')
+      return
+    }
+
+    // Mark as initiated BEFORE any state updates
+    fetchInitiated.add(roomJid)
+    if (debug) console.log('[SideEffects] Room: Starting MAM catchup for', roomJid)
+
+    try {
+      const messages = room.messages || []
+      const newestCachedMessage = messages[messages.length - 1]
+
+      if (newestCachedMessage?.timestamp) {
+        // Query for messages AFTER the newest cached message (catchup)
+        const startTime = new Date(newestCachedMessage.timestamp.getTime() + 1)
+        await client.chat.queryRoomMAM({
+          roomJid,
+          start: startTime.toISOString(),
+          max: 100,
+        })
+      } else {
+        // No cached messages - fetch latest
+        await client.chat.queryRoomMAM({
+          roomJid,
+          before: '', // Empty = get latest
+          max: 50,
+        })
+      }
+      if (debug) console.log('[SideEffects] Room: MAM catchup complete')
+    } catch (error) {
+      // Only log if it's not a disconnection error (those are expected during reconnect)
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      if (!errorMsg.includes('disconnected')) {
+        console.error('[SideEffects] Room: MAM catchup failed:', error)
+      } else if (debug) {
+        console.log('[SideEffects] Room: MAM skipped - client disconnected')
+      }
+    }
+  }
 
   const unsubscribe = roomStore.subscribe(
     // Selector: only react to activeRoomJid changes
     (state) => state.activeRoomJid,
     // Handler: runs when activeRoomJid changes
     (activeRoomJid, previousRoomJid) => {
-      // Clear tracking for previous room
+      // Clear tracking for previous room (allow re-fetch on return)
       if (previousRoomJid) {
-        cacheLoaded.delete(previousRoomJid)
+        fetchInitiated.delete(previousRoomJid)
       }
 
       if (!activeRoomJid) {
@@ -278,30 +344,51 @@ export function setupRoomSideEffects(
         return
       }
 
-      // Already loaded for this room
-      if (cacheLoaded.has(activeRoomJid)) {
-        if (debug) console.log('[SideEffects] Room: Cache already loaded')
-        return
-      }
-
       // Run async operations outside the synchronous subscriber
       void (async () => {
-        // Load from IndexedDB cache
+        // Step 1: Load from IndexedDB cache immediately
         const existingMessages = roomStore.getState().rooms.get(activeRoomJid)?.messages
         if (!existingMessages || existingMessages.length === 0) {
-          cacheLoaded.add(activeRoomJid)
           if (debug) console.log('[SideEffects] Room: Loading from cache')
           await roomStore.getState().loadMessagesFromCache(activeRoomJid, { limit: 100 })
-        } else {
-          cacheLoaded.add(activeRoomJid)
-          if (debug) console.log('[SideEffects] Room: Already has messages in memory')
         }
+
+        // Step 2: Background MAM fetch for catchup (skip if already initiated this session)
+        if (fetchInitiated.has(activeRoomJid)) {
+          if (debug) console.log('[SideEffects] Room: MAM already initiated for', activeRoomJid)
+          return
+        }
+
+        await fetchMAMForRoom(activeRoomJid)
       })()
     },
     { fireImmediately: false }
   )
 
-  return unsubscribe
+  // Subscribe to connection status changes (for reconnection catch-up)
+  let previousStatus = connectionStore.getState().status
+  const unsubscribeConnection = connectionStore.subscribe((state) => {
+    const status = state.status
+    // When we come back online after being disconnected
+    if (status === 'online' && previousStatus !== 'online') {
+      const activeRoomJid = roomStore.getState().activeRoomJid
+      if (activeRoomJid) {
+        if (debug) console.log('[SideEffects] Room: Reconnected, catching up active room', activeRoomJid)
+
+        // Clear the fetch tracking so we can re-fetch after reconnect
+        fetchInitiated.delete(activeRoomJid)
+
+        // Trigger MAM catch-up for the active room
+        void fetchMAMForRoom(activeRoomJid)
+      }
+    }
+    previousStatus = status
+  })
+
+  return () => {
+    unsubscribe()
+    unsubscribeConnection()
+  }
 }
 
 /**
