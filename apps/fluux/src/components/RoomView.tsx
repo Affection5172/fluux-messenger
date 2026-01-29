@@ -560,6 +560,8 @@ const RoomMessageBubbleWrapper = memo(function RoomMessageBubbleWrapper({
   onMouseEnter,
   onMouseLeave,
 }: RoomMessageBubbleWrapperProps) {
+  const { t } = useTranslation()
+
   // Get occupant info if available
   const occupant = room.occupants.get(message.nick)
   const myNick = room.nickname
@@ -615,10 +617,13 @@ const RoomMessageBubbleWrapper = memo(function RoomMessageBubbleWrapper({
   ), [message, messagesById, isDarkMode])
 
   // Get reactor display name (for rooms, nicks are shown as-is)
-  const getReactorName = useCallback((nick: string) => {
-    if (nick === myNick) return 'You'
+  // Note: MAM-loaded reactions may use full MUC JID (room@server/nick), so extract nick
+  const getReactorName = useCallback((reactorId: string) => {
+    // Extract nick from full MUC JID (room@server/nick) or use as-is if already a nick
+    const nick = reactorId.includes('/') ? reactorId.split('/').pop() || reactorId : reactorId
+    if (nick === myNick) return t('chat.you')
     return nick
-  }, [myNick])
+  }, [myNick, t])
 
   // Build nick extras (moderator badge and XEP-0317 hats)
   // Note: individual tooltips removed - all info is now in the unified avatar/name tooltip

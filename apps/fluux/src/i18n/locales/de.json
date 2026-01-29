@@ -247,6 +247,7 @@
   },
   "chat": {
     "me": "Ich",
+    "you": "Du",
     "messageTo": "Nachricht an {{name}}",
     "messageRoom": "Nachricht an #{{name}}",
     "editMessage": "Nachricht bearbeiten",

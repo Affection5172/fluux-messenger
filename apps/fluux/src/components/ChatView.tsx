@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback, memo, type RefObject } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useChat, useRoster, usePresence, createMessageLookup, type Message, type Contact } from '@fluux/sdk'
+import { useChat, useRoster, usePresence, createMessageLookup, getBareJid, getLocalPart, type Message, type Contact } from '@fluux/sdk'
 import { useConnectionStore } from '@fluux/sdk/react'
 import { getConsistentTextColor } from './Avatar'
 import { useFileUpload, useLinkPreview, useTypeToFocus, useMessageCopy, useMode, useMessageSelection, useDragAndDrop, useConversationDraft } from '@/hooks'
@@ -544,6 +544,8 @@ const ChatMessageBubble = memo(function ChatMessageBubble({
   onMouseEnter,
   onMouseLeave,
 }: ChatMessageBubbleProps) {
+  const { t } = useTranslation()
+
   // Use display name from roster, fall back to JID username
   // For outgoing messages, use own nickname if set
   const senderContact = contactsByJid.get(message.from.split('/')[0])
@@ -599,11 +601,12 @@ const ChatMessageBubble = memo(function ChatMessageBubble({
     isDarkMode
   ), [message, messagesById, contactsByJid, isDarkMode])
 
-  // Get reactor display name
+  // Get reactor display name (contact name, or username if not in roster)
   const getReactorName = useCallback((jid: string) => {
-    if (jid === myBareJid) return 'You'
-    return contactsByJid.get(jid)?.name || jid.split('@')[0]
-  }, [myBareJid, contactsByJid])
+    const bareJid = getBareJid(jid)
+    if (bareJid === myBareJid) return t('chat.you')
+    return contactsByJid.get(bareJid)?.name || getLocalPart(jid)
+  }, [myBareJid, contactsByJid, t])
 
   return (
     <MessageBubble

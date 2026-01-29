@@ -247,6 +247,7 @@
   },
   "chat": {
     "me": "Ja",
+    "you": "Ty",
     "messageTo": "Wiadomosc do {{name}}",
     "messageRoom": "Wiadomosc do #{{name}}",
     "editMessage": "Edytuj wiadomosc",

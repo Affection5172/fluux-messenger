@@ -44,6 +44,8 @@ const mockClearAnimation = vi.fn()
 
 // Mock SDK hooks
 vi.mock('@fluux/sdk', () => ({
+  getBareJid: (jid: string) => jid.split('/')[0],
+  getLocalPart: (jid: string) => jid.split('@')[0],
   useChat: () => ({
     activeConversation: mockActiveConversation,
     activeMessages: mockActiveMessages,
