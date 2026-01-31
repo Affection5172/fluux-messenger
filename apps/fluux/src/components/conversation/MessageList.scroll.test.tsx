@@ -818,6 +818,71 @@ describe('MessageList scroll behavior', () => {
   })
 
   describe('scroll position restoration on conversation switch', () => {
+    it('should use deferred scroll-to-bottom with RAF when switching to new conversation', () => {
+      // This test verifies the fix for the bug where messages appeared aligned to top
+      // when navigating via notification or Option+U. The issue was that scrollHeight
+      // reflected old DOM content when the useLayoutEffect ran.
+      //
+      // The fix uses requestAnimationFrame to defer scroll until after React renders.
+      const messages = createTestMessages(10)
+      const scrollSpy = vi.fn()
+      let rafCallCount = 0
+
+      // Track RAF calls to verify deferred scrolling is used
+      window.requestAnimationFrame = (cb: FrameRequestCallback) => {
+        rafCallCount++
+        cb(0)
+        return rafCallCount
+      }
+
+      // Render conversation A (not previously visited - will scroll to bottom)
+      const { rerender } = render(
+        <MessageList
+          messages={messages}
+          conversationId="conv-new"
+          clearFirstNewMessageId={vi.fn()}
+          renderMessage={(msg) => <div key={msg.id}>{msg.body}</div>}
+        />
+      )
+
+      const container = document.querySelector('.overflow-y-auto') as HTMLDivElement
+      if (container) {
+        let scrollTopValue = 0
+        Object.defineProperty(container, 'scrollHeight', { value: 1000, configurable: true })
+        Object.defineProperty(container, 'clientHeight', { value: 500, configurable: true })
+        Object.defineProperty(container, 'scrollTop', {
+          get: () => scrollTopValue,
+          set: (v) => {
+            scrollTopValue = v
+            scrollSpy(v)
+          },
+          configurable: true,
+        })
+
+        // Reset counters after initial render
+        rafCallCount = 0
+        scrollSpy.mockClear()
+
+        // Switch to a different, never-visited conversation
+        // This simulates the Option+U or notification click scenario
+        rerender(
+          <MessageList
+            messages={messages}
+            conversationId="conv-another-new"
+            clearFirstNewMessageId={vi.fn()}
+            renderMessage={(msg) => <div key={msg.id}>{msg.body}</div>}
+          />
+        )
+
+        // RAF should have been called (deferred scroll)
+        expect(rafCallCount).toBeGreaterThan(0)
+
+        // Scroll to bottom should have been called multiple times
+        // (immediate + deferred via RAF)
+        expect(scrollSpy).toHaveBeenCalledWith(1000)
+      }
+    })
+
     it('should restore scroll position when returning to a conversation that was scrolled up', () => {
       const messages = createTestMessages(10)
       const scrollSpy = vi.fn()
