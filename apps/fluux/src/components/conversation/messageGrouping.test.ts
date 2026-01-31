@@ -1,6 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { groupMessagesByDate, shouldShowAvatar, scrollToMessage, isActionMessage } from './messageGrouping'
 
+// Mock CSS.escape since it's not available in JSDOM
+// This implementation matches the browser's CSS.escape behavior
+vi.stubGlobal('CSS', {
+  escape: (str: string) => str.replace(/([\/\@\+\=])/g, '\\$1'),
+})
+
 describe('groupMessagesByDate', () => {
   it('should group messages by date', () => {
     const messages = [
@@ -177,6 +183,8 @@ describe('scrollToMessage', () => {
     }
   }
   let querySelectorSpy: ReturnType<typeof vi.spyOn>
+  let querySelectorAllSpy: ReturnType<typeof vi.spyOn>
+  let consoleWarnSpy: ReturnType<typeof vi.spyOn>
 
   beforeEach(() => {
     vi.useFakeTimers()
@@ -188,6 +196,8 @@ describe('scrollToMessage', () => {
       },
     }
     querySelectorSpy = vi.spyOn(document, 'querySelector')
+    querySelectorAllSpy = vi.spyOn(document, 'querySelectorAll').mockReturnValue([] as unknown as NodeListOf<Element>)
+    consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
   })
 
   afterEach(() => {
@@ -230,14 +240,29 @@ describe('scrollToMessage', () => {
 
     expect(querySelectorSpy).toHaveBeenCalledWith('[data-message-id="non-existent-id"]')
     expect(mockElement.scrollIntoView).not.toHaveBeenCalled()
+    // Should log warning for debugging
+    expect(consoleWarnSpy).toHaveBeenCalledWith(
+      '[scrollToMessage] Message not found in DOM: id="non-existent-id"'
+    )
   })
 
-  it('should handle special characters in message ID', () => {
+  it('should handle special characters in message ID by escaping them', () => {
     querySelectorSpy.mockReturnValue(mockElement as unknown as Element)
 
     scrollToMessage('msg-with-special/chars@123')
 
-    expect(querySelectorSpy).toHaveBeenCalledWith('[data-message-id="msg-with-special/chars@123"]')
+    // CSS.escape escapes special characters like / and @ with backslashes
+    expect(querySelectorSpy).toHaveBeenCalledWith('[data-message-id="msg-with-special\\/chars\\@123"]')
+    expect(mockElement.scrollIntoView).toHaveBeenCalled()
+  })
+
+  it('should escape base64 encoded message IDs', () => {
+    querySelectorSpy.mockReturnValue(mockElement as unknown as Element)
+
+    // Base64 IDs often contain +, /, and = characters
+    scrollToMessage('abc+def/ghi=jkl')
+
+    expect(querySelectorSpy).toHaveBeenCalledWith('[data-message-id="abc\\+def\\/ghi\\=jkl"]')
     expect(mockElement.scrollIntoView).toHaveBeenCalled()
   })
 })

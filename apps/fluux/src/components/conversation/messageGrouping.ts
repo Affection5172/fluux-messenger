@@ -75,10 +75,20 @@ export function shouldShowAvatar<T extends GroupableMessage>(messages: T[], inde
  * @param messageId - The ID of the message to scroll to (matches data-message-id attribute)
  */
 export function scrollToMessage(messageId: string): void {
-  const element = document.querySelector(`[data-message-id="${messageId}"]`)
+  // Use CSS.escape to handle special characters in message IDs (e.g., +, /, =)
+  // Some clients use base64-encoded IDs that contain these characters
+  const escapedId = CSS.escape(messageId)
+  const element = document.querySelector(`[data-message-id="${escapedId}"]`)
   if (element) {
     element.scrollIntoView({ behavior: 'smooth', block: 'center' })
     element.classList.add('message-highlight')
     setTimeout(() => element.classList.remove('message-highlight'), 1500)
+  } else {
+    // Debug: message not found in DOM, log to help diagnose issues
+    console.warn(`[scrollToMessage] Message not found in DOM: id="${messageId}"`)
+    // List all message IDs in DOM for debugging (limit to 20)
+    const allMsgEls = document.querySelectorAll('[data-message-id]')
+    const ids = Array.from(allMsgEls).slice(-20).map(el => el.getAttribute('data-message-id'))
+    console.warn(`[scrollToMessage] Last ${ids.length} message IDs in DOM:`, ids)
   }
 }
