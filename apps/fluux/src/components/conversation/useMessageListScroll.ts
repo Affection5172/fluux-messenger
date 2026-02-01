@@ -383,7 +383,26 @@ export function useMessageListScroll({
       isAtBottomRef.current = false
       scrollStateManager.clearSavedScrollState(conversationId)
     } else {
+      // Scroll to bottom on new conversation entry.
+      // We use both immediate and deferred scroll because:
+      // 1. Immediate: Works when content is already rendered (useLayoutEffect runs after DOM mutations)
+      // 2. Deferred: Catches edge cases where React's reconciliation hasn't finished
+      //    (e.g., navigating via Option+U or notification click from a different view)
+      //
+      // Note: Async content loading (MAM) is handled by the separate "new message" effect
+      // which triggers when messageCount changes.
       scroller.scrollTop = scroller.scrollHeight
+
+      requestAnimationFrame(() => {
+        if (scrollerRef.current) {
+          scrollerRef.current.scrollTop = scrollerRef.current.scrollHeight
+          debugLog('CONVERSATION SWITCH: scrolled to bottom (deferred)', {
+            scrollTop: scrollerRef.current.scrollTop,
+            scrollHeight: scrollerRef.current.scrollHeight,
+          })
+        }
+      })
+
       isAtBottomRef.current = true
     }
 

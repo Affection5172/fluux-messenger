@@ -427,6 +427,7 @@ const ChatMessageList = memo(function ChatMessageList({
       message={msg}
       showAvatar={shouldShowAvatar(groupMessages, idx)}
       avatar={msg.isOutgoing ? ownAvatar ?? undefined : contactsByJid.get(msg.from)?.avatar}
+      ownAvatar={ownAvatar}
       ownNickname={ownNickname}
       ownPresence={ownPresence}
       conversationId={conversationId}
@@ -490,6 +491,7 @@ interface ChatMessageBubbleProps {
   message: Message
   showAvatar: boolean
   avatar?: string
+  ownAvatar?: string | null
   ownNickname?: string | null
   ownPresence?: 'online' | 'away' | 'dnd' | 'offline'
   conversationId: string
@@ -520,6 +522,7 @@ const ChatMessageBubble = memo(function ChatMessageBubble({
   message,
   showAvatar,
   avatar,
+  ownAvatar,
   ownNickname,
   ownPresence,
   conversationId,
@@ -584,12 +587,18 @@ const ChatMessageBubble = memo(function ChatMessageBubble({
     message,
     messagesById,
     (originalMsg, fallbackId) => {
+      // Own messages: use ownNickname or JID username
+      if (originalMsg?.isOutgoing) {
+        return ownNickname || originalMsg.from.split('@')[0]
+      }
       if (originalMsg) {
         return contactsByJid.get(originalMsg.from.split('/')[0])?.name || originalMsg.from.split('@')[0]
       }
       return fallbackId ? fallbackId.split('@')[0] : 'Unknown'
     },
     (originalMsg, fallbackId, dark) => {
+      // Own messages: use green color
+      if (originalMsg?.isOutgoing) return 'var(--fluux-green)'
       const senderId = originalMsg?.from.split('/')[0] || fallbackId?.split('/')[0]
       if (!senderId) return 'var(--fluux-brand)'
       const contact = contactsByJid.get(senderId)
@@ -598,8 +607,23 @@ const ChatMessageBubble = memo(function ChatMessageBubble({
       }
       return getConsistentTextColor(senderId, dark)
     },
+    (originalMsg, fallbackId) => {
+      const senderId = originalMsg?.from.split('/')[0] || fallbackId?.split('/')[0]
+      // If the quoted message is from the current user, use own avatar
+      if (senderId === myBareJid) {
+        return {
+          avatarUrl: ownAvatar || undefined,
+          avatarIdentifier: senderId || 'unknown',
+        }
+      }
+      const contact = senderId ? contactsByJid.get(senderId) : undefined
+      return {
+        avatarUrl: contact?.avatar,
+        avatarIdentifier: senderId || 'unknown',
+      }
+    },
     isDarkMode
-  ), [message, messagesById, contactsByJid, isDarkMode])
+  ), [message, messagesById, contactsByJid, isDarkMode, myBareJid, ownAvatar, ownNickname])
 
   // Get reactor display name (contact name, or username if not in roster)
   const getReactorName = useCallback((jid: string) => {

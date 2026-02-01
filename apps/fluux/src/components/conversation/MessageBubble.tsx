@@ -5,11 +5,10 @@
  * the common bubble structure.
  */
 import { useState, memo, type ReactNode } from 'react'
-import { useTranslation } from 'react-i18next'
 import { format } from 'date-fns'
+import { CornerUpLeft } from 'lucide-react'
 import type { BaseMessage, MentionReference, Contact, RoomRole, RoomAffiliation } from '@fluux/sdk'
 import { Avatar } from '../Avatar'
-import { Tooltip } from '../Tooltip'
 import { MessageToolbar } from './MessageToolbar'
 import { MessageBody } from './MessageBody'
 import { MessageReactions } from './MessageReactions'
@@ -73,6 +72,8 @@ export interface MessageBubbleProps {
     senderColor: string
     body: string
     messageId: string
+    avatarUrl?: string
+    avatarIdentifier: string
   }
 
   // Room-specific: mentions for highlighting
@@ -136,6 +137,8 @@ function arePropsEqual(prev: MessageBubbleProps, next: MessageBubbleProps): bool
     if (prev.replyContext.messageId !== next.replyContext.messageId) return false
     if (prev.replyContext.body !== next.replyContext.body) return false
     if (prev.replyContext.senderName !== next.replyContext.senderName) return false
+    if (prev.replyContext.avatarUrl !== next.replyContext.avatarUrl) return false
+    if (prev.replyContext.avatarIdentifier !== next.replyContext.avatarIdentifier) return false
   }
 
   // Mentions - compare by reference (parent should memoize)
@@ -184,7 +187,6 @@ export const MessageBubble = memo(function MessageBubble({
   mentions,
   onReactionPickerChange,
 }: MessageBubbleProps) {
-  const { t } = useTranslation()
   const [showReactionPicker, setShowReactionPickerState] = useState(false)
   const [showMoreMenu, setShowMoreMenu] = useState(false)
 
@@ -290,23 +292,30 @@ export const MessageBubble = memo(function MessageBubble({
 
         {/* Reply context - show what message this is replying to (hidden for retracted messages) */}
         {!message.isRetracted && replyContext && (
-          <Tooltip content={t('chat.jumpToOriginal')} position="top">
-            <button
-              onClick={() => scrollToMessage(replyContext.messageId)}
-              className="flex items-start gap-2 pb-1 pl-2 border-l-2 border-fluux-brand text-left w-full hover:bg-fluux-hover/50 rounded-r transition-colors cursor-pointer select-none"
-            >
-              <div className="text-xs text-fluux-muted min-w-0 flex-1">
-                <span
-                  className="font-medium"
-                  style={{ color: replyContext.senderColor }}
-                >{replyContext.senderName}</span>
-                <p className="line-clamp-2 opacity-75">{replyContext.body}</p>
-              </div>
-            </button>
-          </Tooltip>
+          <button
+            onClick={() => scrollToMessage(replyContext.messageId)}
+            className="flex items-start gap-1.5 pb-1 pl-2 border-l-2 text-left w-full hover:bg-fluux-hover/50 rounded-r transition-colors cursor-pointer select-none"
+            style={{ borderColor: replyContext.senderColor }}
+          >
+            <CornerUpLeft className="w-3.5 h-3.5 text-fluux-muted flex-shrink-0 mt-0.5" />
+            <Avatar
+              identifier={replyContext.avatarIdentifier}
+              name={replyContext.senderName}
+              avatarUrl={replyContext.avatarUrl}
+              size="xs"
+              className="flex-shrink-0"
+            />
+            <div className="text-sm text-fluux-muted min-w-0 flex-1">
+              <span
+                className="font-medium"
+                style={{ color: replyContext.senderColor }}
+              >{replyContext.senderName}</span>
+              <p className="line-clamp-2 opacity-75">{replyContext.body}</p>
+            </div>
+          </button>
         )}
 
-        {/* Message body */}
+        {/* Message body (SDK already strips OOB URL from body for non-XEP-0428 clients) */}
         <MessageBody
           body={message.body}
           isEdited={message.isEdited}
@@ -316,7 +325,6 @@ export const MessageBubble = memo(function MessageBubble({
           senderName={senderName}
           senderColor={senderColor}
           mentions={mentions}
-          hasAttachmentThumbnail={!!message.attachment?.thumbnail}
         />
 
         {/* File attachments (image, video, audio, text preview, document card) - hidden for retracted */}
@@ -345,6 +353,7 @@ export const MessageBubble = memo(function MessageBubble({
  * @param messagesById - Map to look up the original message
  * @param getSenderName - Function to get display name from sender ID
  * @param getSenderColor - Function to get color from sender ID
+ * @param getAvatarInfo - Function to get avatar URL and identifier from sender
  * @returns ReplyContext or undefined if no reply
  */
 export function buildReplyContext<T extends BaseMessage>(
@@ -352,6 +361,7 @@ export function buildReplyContext<T extends BaseMessage>(
   messagesById: Map<string, T>,
   getSenderName: (msg: T | undefined, fallbackId: string | undefined) => string,
   getSenderColor: (msg: T | undefined, fallbackId: string | undefined, isDarkMode?: boolean) => string,
+  getAvatarInfo: (msg: T | undefined, fallbackId: string | undefined) => { avatarUrl?: string; avatarIdentifier: string },
   isDarkMode?: boolean
 ): MessageBubbleProps['replyContext'] {
   if (!message.replyTo) return undefined
@@ -361,11 +371,19 @@ export function buildReplyContext<T extends BaseMessage>(
   const senderName = getSenderName(originalMessage, fallbackId)
   const senderColor = getSenderColor(originalMessage, fallbackId, isDarkMode)
   const body = originalMessage?.body || message.replyTo.fallbackBody || 'Original message not found'
+  const { avatarUrl, avatarIdentifier } = getAvatarInfo(originalMessage, fallbackId)
+
+  // Use the original message's actual ID for scrolling.
+  // The replyTo.id may reference the stanza-id (from MAM), but the DOM uses
+  // the client-generated message.id for data-message-id attributes.
+  const messageId = originalMessage?.id ?? message.replyTo.id
 
   return {
     senderName,
     senderColor,
     body,
-    messageId: message.replyTo.id,
+    messageId,
+    avatarUrl,
+    avatarIdentifier,
   }
 }
