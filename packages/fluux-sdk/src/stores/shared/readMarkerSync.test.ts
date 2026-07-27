@@ -112,6 +112,194 @@ describe('resolveRemoteDisplayed', () => {
 
     expect(result.kind).toBe('clear-pending')
   })
+
+  it('keeps the marker pending when an off-slice position ties the marker', () => {
+    // The fresh-session forward catch-up merges only the newest MAM page: the
+    // marker's message is in it, but the message the local pointer names is
+    // still on disk. `onMessageSeen` refuses to advance against a pointer it
+    // cannot locate, and a tied timestamp cannot break it either — MAM archives
+    // routinely put two messages in the same millisecond. Nothing was resolved,
+    // and reading that as "already read" would lose the remote position for
+    // good, since the activation fold (which loads a wide enough slice) would
+    // then have nothing left to apply.
+    const offSlicePointer = {
+      messageId: 'ties-m3',
+      timestamp: new Date('2024-01-15T10:03:00Z'),
+    }
+
+    const result = resolveRemoteDisplayed(
+      { ...baseMeta, readPointer: offSlicePointer, pendingRemoteDisplayedStanzaId: 'arch-m3' },
+      messages,
+      undefined,
+      'arch-m3',
+      { isActive: false }
+    )
+
+    expect(result.kind).toBe('stash-pending')
+  })
+
+  it('discards an off-slice marker the local position is provably past', () => {
+    // Local pointer far ahead (m200) and an older remote marker (m20). A slice
+    // holding m20 cannot hold m200, and a load-around m200 cannot reach back to
+    // m20, so no retry will ever contain both — stashing here would leave the
+    // marker pending forever, re-folding on every activation. The timestamps
+    // decide it outright: the marker is behind, so there is nothing to apply.
+    const result = resolveRemoteDisplayed(
+      {
+        ...baseMeta,
+        readPointer: { messageId: 'newer-than-slice', timestamp: new Date('2024-01-15T11:00:00Z') },
+        pendingRemoteDisplayedStanzaId: 'arch-m3',
+      },
+      messages,
+      undefined,
+      'arch-m3',
+      { isActive: false }
+    )
+
+    expect(result.kind).toBe('clear-pending')
+  })
+
+  it('keeps the marker pending when the off-slice position carries the epoch sentinel', () => {
+    // Epoch is the legacy "no read time recorded" value: every real message
+    // beats it, so it cannot decide the comparison and must not be trusted to.
+    const result = resolveRemoteDisplayed(
+      {
+        ...baseMeta,
+        readPointer: { messageId: 'older-than-slice', timestamp: new Date(0) },
+        pendingRemoteDisplayedStanzaId: 'arch-m3',
+      },
+      messages,
+      undefined,
+      'arch-m3',
+      { isActive: false }
+    )
+
+    expect(result.kind).toBe('stash-pending')
+  })
+
+  it('keeps a newer-timestamped off-slice marker pending', () => {
+    // A migrated pointer can carry a timestamp from well before the message it
+    // names, so a newer marker timestamp is not proof of a forward advance.
+    const result = resolveRemoteDisplayed(
+      {
+        ...baseMeta,
+        readPointer: { messageId: 'may-name-a-newer-message', timestamp: new Date('2024-01-15T09:00:00Z') },
+        pendingRemoteDisplayedStanzaId: 'arch-m3',
+      },
+      messages,
+      undefined,
+      'arch-m3',
+      { isActive: false }
+    )
+
+    expect(result.kind).toBe('stash-pending')
+  })
+
+  it('stashes rather than reporting unchanged for an undecidable position with nothing pending', () => {
+    // Same unresolvable case reached from a live notify (no pending mark yet):
+    // it must still record the high-water mark so the activation fold retries.
+    const result = resolveRemoteDisplayed(
+      {
+        ...baseMeta,
+        readPointer: { messageId: 'ties-m3', timestamp: new Date('2024-01-15T10:03:00Z') },
+      },
+      messages,
+      undefined,
+      'arch-m3',
+      { isActive: false }
+    )
+
+    expect(result.kind).toBe('stash-pending')
+  })
+
+  it('retires a provably-past off-slice marker on the ACTIVE entity too', () => {
+    // The retire direction is the one timestamps CAN settle: `lastReadAt` is at
+    // or behind the message the pointer names, so a marker older than it is
+    // older than the true position as well. Nothing is derived from the
+    // timestamp here — the pointer is left exactly where it was.
+    const result = resolveRemoteDisplayed(
+      {
+        ...baseMeta,
+        readPointer: { messageId: 'newer-than-slice', timestamp: new Date('2024-01-15T11:00:00Z') },
+        pendingRemoteDisplayedStanzaId: 'arch-m3',
+      },
+      messages,
+      'm2',
+      'arch-m3',
+      { isActive: true }
+    )
+
+    expect(result.kind).toBe('clear-pending')
+  })
+
+  it('survives an off-slice catch-up and resolves on the later activation fold', () => {
+    const gate = createMdsSessionGate()
+    const fullHistory = [
+      msg('m1', '2024-01-15T10:01:00Z'),
+      msg('m2', '2024-01-15T10:02:00Z'),
+      msg('m3', '2024-01-15T10:03:00Z'),
+      msg('m4', '2024-01-15T10:04:00Z'),
+    ]
+    const latestPage = fullHistory.slice(2)
+    let readPointer = {
+      messageId: 'm1',
+      timestamp: new Date('2024-01-15T10:01:00Z'),
+    }
+    let pending: string | undefined = 'arch-m3'
+    let firstNewMessageId: string | undefined = 'm2'
+
+    // Fresh-session forward catch-up only has the newest page. It contains the
+    // remote marker (m3), but not the local pointer (m1), so the comparison is
+    // deliberately postponed instead of destroying the pending marker.
+    const catchUp = resolveRemoteDisplayed(
+      {
+        ...baseMeta,
+        unreadCount: 26,
+        readPointer,
+        pendingRemoteDisplayedStanzaId: pending,
+      },
+      latestPage,
+      firstNewMessageId,
+      pending,
+      { isActive: false }
+    )
+    expect(catchUp).toEqual({ kind: 'stash-pending' })
+    expect(pending).toBe('arch-m3')
+
+    // Opening the entity loads a wide enough slice to order both ends by
+    // index. The normal activation fold can now advance to the remote position
+    // and move the stale divider from m2 to the first truly unread message, m4.
+    const fold = foldPendingRemoteDisplayed(
+      gate,
+      'xsf@muc.xmpp.org',
+      () => pending,
+      (stanzaId) => {
+        const activated = resolveRemoteDisplayed(
+          {
+            ...baseMeta,
+            unreadCount: 0,
+            readPointer,
+            pendingRemoteDisplayedStanzaId: pending,
+          },
+          fullHistory,
+          firstNewMessageId,
+          stanzaId,
+          { isActive: true }
+        )
+        expect(activated.kind).toBe('advanced-with-divider')
+        if (activated.kind === 'advanced-with-divider') {
+          readPointer = activated.readPointer
+          firstNewMessageId = activated.firstNewMessageId
+          pending = undefined
+        }
+      }
+    )
+
+    expect(fold).toEqual({ pending: 'arch-m3', attempted: true, resolved: true })
+    expect(readPointer.messageId).toBe('m3')
+    expect(firstNewMessageId).toBe('m4')
+    expect(pending).toBeUndefined()
+  })
 })
 
 describe('createMdsSessionGate', () => {
