@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback, useId, useImperativeHandle, useMemo, memo, type RefObject } from 'react'
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useId, useImperativeHandle, useMemo, memo, type RefObject } from 'react'
 import { useTranslation } from 'react-i18next'
 import { detectRenderLoop } from '@/utils/renderLoopDetector'
 import { useRoomActive, usePolls, useRoomModeration, useRoomManagement, useRoomEntity, useContactIdentities, getBareJid, generateConsistentColorHexSync, createMessageLookup, useReferencedMessage, isMessageFromIgnoredUser, isReplyToIgnoredUser, filterIgnoredReactions, canKick, canBan, getAvailableAffiliations, getAvailableRoles, getMyReactions, WhisperCounterpartGoneError, type RoomMessage, type Room, type RoomOccupant, type MentionReference, type ChatStateNotification, type ContactIdentity, type FileAttachment, type RoomAffiliation, type RoomRole, type PollData } from '@fluux/sdk'
@@ -1807,6 +1807,20 @@ export const RoomMessageInput = memo(function RoomMessageInput({
     onDraftRestored: handleDraftRestored,
   })
 
+  // Keep the mention mirror's scroll offset locked to the textarea's after every
+  // content change. The textarea's own scroll event is not sufficient: on a
+  // keystroke the browser scrolls to reveal the caret BEFORE React re-renders the
+  // mirror, so the handler copies the offset while the mirror is still a line
+  // short — the write clamps to 0 and nothing re-syncs once the content lands.
+  // Re-asserting here, after the DOM is updated and before paint, is what keeps
+  // the highlighted text under the caret on the newline that grows the draft.
+  const mirrorRef = useRef<HTMLDivElement | null>(null)
+  useLayoutEffect(() => {
+    const mirror = mirrorRef.current
+    const input = textareaRef?.current
+    if (mirror && input) mirror.scrollTop = input.scrollTop
+  }, [text, textareaRef])
+
   // Exit whisper mode AND discard the typed text. The composer draft is keyed only
   // by room JID, so a private whisper draft would otherwise survive into the public
   // composer and could be sent to the whole room. Discarding upholds the invariant:
@@ -2192,16 +2206,21 @@ export const RoomMessageInput = memo(function RoomMessageInput({
     return (
       <>
         {/* Background layer with styled mentions - positioned absolutely within parent wrapper */}
+        {/* The mirror must wrap at exactly the textarea's content width, or the
+            glyphs the user reads drift away from the caret they sit under. The
+            styled scrollbar takes layout, so the width depends on whether a
+            scrollbar is reserved — and `scrollbar-gutter: stable` (index.css)
+            only reserves one on an overflow:hidden box in Blink, not WebKit,
+            which is the engine the desktop app runs. Matching the textarea's
+            `overflow-y: auto` makes the reservation track it in every engine:
+            both boxes hold the same content at the same height, so they cross
+            the overflow boundary together. `composer-mirror` then hides this
+            layer's own scrollbar without giving back the width it reserves. */}
         <div
-          className="message-input absolute inset-0 px-2 py-3 pointer-events-none whitespace-pre-wrap
-                     overflow-hidden"
+          className="message-input composer-mirror absolute inset-0 px-2 pointer-events-none
+                     whitespace-pre-wrap overflow-y-auto overflow-x-hidden"
           aria-hidden="true"
-          ref={(el) => {
-            // Sync scroll position with textarea
-            if (el && inputRef.current) {
-              el.scrollTop = inputRef.current.scrollTop
-            }
-          }}
+          ref={mirrorRef}
         >
           {renderInputWithMentions(value, references)}
         </div>
@@ -2369,12 +2388,27 @@ function RoomJoinPrompt({
  * Render text with @mentions highlighted for the input overlay
  * Only highlights completed mentions (those in the references array)
  */
+/**
+ * A `pre-wrap` container lays out no line box for a terminal newline, but a
+ * textarea does — so for any draft ending in a newline the mirror is one line
+ * shorter than the textarea it has to match. At the cap that means it never
+ * becomes a scroll container: it reserves no scrollbar gutter (a 6px wrap
+ * mismatch in WebKit) and cannot follow the textarea's scrollTop, so the
+ * highlighted text drifts away from the caret. Pressing Enter for a new line is
+ * the most ordinary way to hit this. A zero-width space forces the final line
+ * box without contributing any advance width.
+ */
+const TRAILING_LINE_SENTINEL = '\u200b'
+
 function renderInputWithMentions(text: string, references: MentionReference[]): React.ReactNode {
   if (!text) return null
 
+  // However many newlines a draft ends with, only the last one loses its line box.
+  const sentinel = text.endsWith('\n') ? TRAILING_LINE_SENTINEL : ''
+
   // If no references, render plain text
   if (references.length === 0) {
-    return <span className="text-fluux-text">{text}</span>
+    return <span className="text-fluux-text">{text + sentinel}</span>
   }
 
   // Sort references by begin position
@@ -2405,11 +2439,18 @@ function renderInputWithMentions(text: string, references: MentionReference[]): 
     lastIndex = ref.end
   }
 
-  // Add any remaining text after the last mention
+  // Add any remaining text after the last mention. The sentinel rides along on
+  // that trailing run, or stands alone when a mention ends the draft.
   if (lastIndex < text.length) {
     parts.push(
       <span key="text-end" className="text-fluux-text">
-        {text.slice(lastIndex)}
+        {text.slice(lastIndex) + sentinel}
+      </span>
+    )
+  } else if (sentinel) {
+    parts.push(
+      <span key="text-end" className="text-fluux-text">
+        {sentinel}
       </span>
     )
   }
