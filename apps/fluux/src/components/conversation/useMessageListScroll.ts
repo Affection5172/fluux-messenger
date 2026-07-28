@@ -299,11 +299,10 @@ export interface UseMessageListScrollOptions {
    *  while the reader is sticked to the bottom, so the growth is absorbed above (previous messages
    *  scroll up) instead of shoving the newest message down. */
   rowGrowthSignature: string
-  /** Whether the floating typing-indicator pill is currently shown. The footer reserves extra bottom
-   *  padding to clear the pill only while this is true; the 0→true edge drives the same instant
-   *  bottom re-pin as a reaction growing a row, gated on live geometry (see the reactions
-   *  effect) so it never fires for a reader scrolled up into history — the #918 "fight" was a stale
-   *  isAtBottomRef latch, not the padding change itself. */
+  /** Whether the in-flow typing-indicator band below the scrollport is currently shown. Its 0→true
+   *  edge shrinks the scrollport and drives the same instant bottom re-pin as a reaction growing a
+   *  row, gated on live geometry (see the typing effect) so it never fires for a reader scrolled up
+   *  into history — the #918 "fight" was a stale isAtBottomRef latch. */
   hasTypingIndicator?: boolean
   /** Whether the newest message is the local user's own (outgoing). When a NEW such message
    *  appears we scroll to the bottom regardless of position — you always want to see what you
@@ -3374,8 +3373,8 @@ export function useMessageListScroll({
   // last one: a row grown in the middle of the viewport would otherwise push everything below it
   // (including the newest message) down.
   //
-  // We route through the controller-owned live-edge convergence that new
-  // messages and the typing footer use) rather than a one-shot scrollToIndex, because the row's
+  // We route through the controller-owned live-edge convergence that new messages and the typing
+  // band use rather than a one-shot scrollToIndex, because the row's
   // ResizeObserver reports the grown height a frame or two AFTER the chip mounts — a single
   // synchronous pin would land on the pre-growth height and still let the bottom dip. The loop polls
   // scrollHeight per frame and re-pins instantly (no smooth easing, so nothing visibly animates),
@@ -3441,18 +3440,18 @@ export function useMessageListScroll({
   }, [rowGrowthSignature, conversationId, staticMode])
 
   // ==========================================================================
-  // EFFECT: Typing indicator appears — reveal its footer clearance while sticked
+  // EFFECT: Typing indicator appears — re-pin under the band it takes from the scrollport
   // ==========================================================================
 
-  // The footer reserves extra bottom padding only while the typing pill is shown (see
-  // MessageList's footer render), so that clearance grows when typing starts. Unlike a reaction's
-  // few-pixel growth, the virtualized footer row needs a remeasure pass before the virtualizer's
-  // computed end offset accounts for the taller padding — a one-shot scrollToIndex lands short (the
-  // spacer hasn't caught up yet), leaving a residual gap under the pill. So this routes through the
-  // shared controller-owned live-edge loop (the same convergence new messages use)
-  // instead of the reactions effect's single smooth nudge. Same two safeguards though: live-geometry
-  // gate (not the latchable isAtBottomRef) and a same-conversation check. Only the false→true edge
-  // nudges; typing stopping SHRINKS the footer, which the browser clamps scrollTop for on its own.
+  // The typing indicator is a band BELOW the scrollport (see MessageList), so showing it shrinks the
+  // scroller by the band's height and leaves a reader who was sticked to the bottom that many pixels
+  // short of it. The scroller's own ResizeObserver would also catch this, but only a frame later
+  // (its correction is rAF-deferred, see the container-resize effect); re-pinning here, in the same
+  // commit that mounts the band, avoids that frame of visible drift. Routed through the shared
+  // controller-owned live-edge loop (the same convergence new messages use) so the virtualized path
+  // re-windows rather than taking a raw scrollTop write. Two safeguards: a live-geometry gate (not
+  // the latchable isAtBottomRef) and a same-conversation check. Only the false→true edge re-pins;
+  // typing stopping GROWS the scroller back, which the browser clamps scrollTop for on its own.
   const prevHasTypingRef = useRef(hasTypingIndicator)
   const typingConvRef = useRef(conversationId)
   useLayoutEffect(() => {
@@ -3461,7 +3460,7 @@ export function useMessageListScroll({
     const prevHasTyping = prevHasTypingRef.current
     prevHasTypingRef.current = hasTypingIndicator
     if (!sameConversation) return // conversation switch → rebaseline, never nudge
-    if (!hasTypingIndicator || prevHasTyping) return // only the off→on edge grows the footer
+    if (!hasTypingIndicator || prevHasTyping) return // only the off→on edge shrinks the scrollport
 
     const scroller = scrollerRef.current
     if (!scroller || staticMode) return
@@ -3505,10 +3504,11 @@ export function useMessageListScroll({
 
       const shrunk = lastHeight - newHeight
       if (shrunk > 0 && scrollerRef.current) {
-        const wasNear = getDistanceFromBottom(scrollerRef.current) <= shrunk + AT_BOTTOM_THRESHOLD
+        const distanceFromBottom = getDistanceFromBottom(scrollerRef.current)
+        const wasNear = distanceFromBottom <= shrunk + AT_BOTTOM_THRESHOLD
         // Route through live-edge reconciliation so the virtualized path re-windows rather
         // than a raw scrollTop write that would leave the mounted window stale → blank/clipped.
-        if (wasNear) {
+        if (wasNear && distanceFromBottom > BOTTOM_PIN_TOLERANCE) {
           reconcileLiveEdgeRef.current('container-shrink')
         }
       } else if (
