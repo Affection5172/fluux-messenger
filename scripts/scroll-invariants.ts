@@ -2244,3 +2244,210 @@ test.describe('Jump-to-last-read pill', () => {
     expect(after.markerIdx, 'the divider must snap FORWARD toward the read pointer').toBeGreaterThan(after.dividerIdx)
   })
 })
+
+test.describe('Fastening stick diagnostic (1:1)', () => {
+  const AVA = 'ava@fluux.chat'
+
+  /**
+   * The reported bug, end to end in a real engine: you send a message containing a link, and the
+   * OGP preview card is fastened onto that ALREADY-RENDERED row seconds later. Nothing about the
+   * message list changes except the row's height — same message count, same last-message id, no
+   * reactions — so this exercises the only trigger that can notice it (the row-growth signature)
+   * AND the real spacer/row geometry the jsdom harness can only approximate.
+   */
+  async function emitLinkMessage(page: Page, jid: string, id: string): Promise<void> {
+    await page.evaluate(([j, i]) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const c = (window as any).__demoClient
+      if (!c) throw new Error('no __demoClient')
+      c.emitSDK('chat:message', {
+        message: {
+          type: 'chat', conversationId: j, from: j, id: i,
+          body: 'look at this https://example.invalid/article',
+          timestamp: new Date(), isOutgoing: false,
+        },
+      })
+    }, [jid, id] as const)
+  }
+
+  async function fastenPreview(page: Page, jid: string, id: string, url: string): Promise<void> {
+    await page.evaluate(([j, i, u]) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const c = (window as any).__demoClient
+      c.emitSDK('chat:message-updated', {
+        conversationId: j,
+        messageId: i,
+        updates: {
+          linkPreview: {
+            url: u,
+            title: 'A fastened link preview card',
+            description:
+              'Fastened after the fact. Long enough that the card is several lines tall, so the ' +
+              'row it grows genuinely pushes the newest message below the fold when nothing re-pins.',
+            siteName: 'example.invalid',
+            // An image gives the card an aspect-video box, so the row grows by well over the
+            // at-bottom threshold — without it the growth stays under the threshold and the test
+            // passes even with a gate that reads post-growth geometry.
+            image: 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
+          },
+        },
+      })
+    }, [jid, id, url] as const)
+  }
+
+  async function bottomState(page: Page, msgId: string) {
+    return page.evaluate((id) => {
+      const s = document.querySelector('[data-message-list]') as HTMLElement | null
+      if (!s) return { visible: false, distFromBottom: -1, scrollHeight: -1 }
+      const el = s.querySelector(`[data-message-id="${CSS.escape(id)}"]`) as HTMLElement | null
+      const sRect = s.getBoundingClientRect()
+      const visible = !!el && el.getBoundingClientRect().bottom <= sRect.bottom + 8
+      return {
+        visible,
+        distFromBottom: Math.round(s.scrollHeight - s.scrollTop - s.clientHeight),
+        scrollHeight: s.scrollHeight,
+      }
+    }, msgId)
+  }
+
+  test('a link-preview fastening on the newest row keeps the view stuck to the bottom', async ({ page }) => {
+    await loadDemo(page)
+    await activateChat(page, AVA)
+    await scrollToBottom(page)
+
+    const id = `fastened-${Date.now()}`
+    const url = `https://example.invalid/${id}`
+    await emitLinkMessage(page, AVA, id)
+    await page.waitForSelector(`[data-message-id="${id}"]`, { timeout: 5_000 })
+    await page.waitForTimeout(SETTLE_MS)
+
+    const before = await bottomState(page, id)
+    expect(before.distFromBottom, 'precondition: must start stuck to the bottom').toBeLessThan(AT_BOTTOM_OK_PX)
+
+    await fastenPreview(page, AVA, id, url)
+    // Wait for the REAL card to be in the DOM — this is the growth the scroll layer must absorb.
+    await page.waitForSelector(`a[href="${url}"]`, { timeout: 5_000 })
+    await page.waitForTimeout(600)
+
+    const after = await bottomState(page, id)
+    // The growth must exceed the at-bottom threshold, otherwise a gate that reads POST-growth
+    // geometry still squeaks under the threshold and the test proves nothing.
+    expect(
+      after.scrollHeight - before.scrollHeight,
+      `the preview card must grow the content by more than the at-bottom threshold (before=${before.scrollHeight}, after=${after.scrollHeight}) — otherwise this test is vacuous`,
+    ).toBeGreaterThan(AT_BOTTOM_OK_PX)
+    expect(
+      after.distFromBottom,
+      `view not re-pinned after the fastening — distFromBottom=${after.distFromBottom}`,
+    ).toBeLessThan(AT_BOTTOM_OK_PX)
+    expect(after.visible, `the fastened message "${id}" was pushed below the fold`).toBe(true)
+  })
+
+  test('a link-preview fastening does not yank a scrolled-up reader to the bottom', async ({ page }) => {
+    await loadDemo(page)
+    await activateChat(page, AVA)
+    await scrollToBottom(page)
+
+    const id = `fastened-up-${Date.now()}`
+    const url = `https://example.invalid/${id}`
+    await emitLinkMessage(page, AVA, id)
+    await page.waitForSelector(`[data-message-id="${id}"]`, { timeout: 5_000 })
+    await page.waitForTimeout(SETTLE_MS)
+
+    await setScrollTop(page, 200)
+    await page.waitForTimeout(SETTLE_MS)
+    const before = await getScrollTop(page)
+
+    await fastenPreview(page, AVA, id, url)
+    await page.waitForSelector(`a[href="${url}"]`, { timeout: 5_000 })
+    await page.waitForTimeout(600)
+
+    const after = await getScrollTop(page)
+    expect(
+      Math.abs(after - before),
+      `a scrolled-up reader was moved by the fastening (${before} -> ${after})`,
+    ).toBeLessThan(AT_BOTTOM_OK_PX)
+  })
+})
+
+test.describe('Fastening + reaction stick diagnostic (1:1)', () => {
+  const AVA = 'ava@fluux.chat'
+
+  // SCOPE: a burst of successive in-place changes on the same row — the message, then its preview
+  // card, then a reaction — must leave the list stuck to the bottom, with no user movement anywhere.
+  // What it demonstrates is that the ACTIVE pin loop absorbs them as they land.
+  //
+  // What it does NOT cover: a growth skipped because a pin loop still claimed the bottom. There is
+  // no second chance for such a growth — nothing re-runs the effect for a consumed signature — so
+  // waiting longer here proves nothing and would only imply a recovery that does not exist. Staging
+  // that case is not possible from here anyway: it needs the preview to commit while the loop still
+  // holds its claim, and the loop converges in ~130ms, faster than emits can be interleaved. The gap
+  // is documented on rowGrowthDecision and pinned by its unit test.
+  test('an active pin loop absorbs a burst of in-place changes on the same row', async ({ page }) => {
+    await loadDemo(page)
+    await activateChat(page, AVA)
+    await scrollToBottom(page)
+
+    const id = `pending-${Date.now()}`
+    const url = `https://example.invalid/${id}`
+
+    // The whole sequence runs INSIDE the page: a Playwright round-trip is far longer than the pin
+    // loop's convergence, so emitting these from separate evaluate() calls spaces them out beyond
+    // anything a real client would produce. In-page they arrive in the burst this is meant to cover
+    // — message, then its preview, then a reaction on the same row.
+    await page.evaluate(async ([j, i, u]) => {
+      const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const c = (window as any).__demoClient
+      c.emitSDK('chat:message', {
+        message: {
+          type: 'chat', conversationId: j, from: j, id: i,
+          body: 'look at this https://example.invalid/article',
+          timestamp: new Date(), isOutgoing: false,
+        },
+      })
+      // Separate ticks, or React batches all three into ONE render and this collapses into a single
+      // row-growth signature change — which is not the sequence under test.
+      await wait(30)
+      c.emitSDK('chat:message-updated', {
+        conversationId: j, messageId: i,
+        updates: {
+          linkPreview: {
+            url: u, title: 'A fastened link preview card',
+            description: 'Fastened after the fact, tall enough to push the newest message below the fold.',
+            siteName: 'example.invalid',
+            image: 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
+          },
+        },
+      })
+      await wait(60)
+      c.emitSDK('chat:message-updated', {
+        conversationId: j, messageId: i,
+        updates: { reactions: { '\u{1F44D}': ['someone@fluux.chat'] } },
+      })
+    }, [AVA, id, url] as const)
+    await page.waitForSelector(`a[href="${url}"]`, { timeout: 5_000 })
+
+    // A normal settle, matching the sibling fastening tests. Deliberately NOT the claim's stale
+    // window: no re-pin is owed after that window, so a longer wait would suggest a second chance
+    // the implementation does not offer.
+    await page.waitForTimeout(600)
+
+    const state = await page.evaluate((msgId) => {
+      const s = document.querySelector('[data-message-list]') as HTMLElement | null
+      if (!s) return { visible: false, distFromBottom: -1 }
+      const el = s.querySelector(`[data-message-id="${CSS.escape(msgId)}"]`) as HTMLElement | null
+      const sRect = s.getBoundingClientRect()
+      return {
+        visible: !!el && el.getBoundingClientRect().bottom <= sRect.bottom + 8,
+        distFromBottom: Math.round(s.scrollHeight - s.scrollTop - s.clientHeight),
+      }
+    }, id)
+
+    expect(
+      state.distFromBottom,
+      `list not pinned after the message+preview+reaction burst — distFromBottom=${state.distFromBottom}`,
+    ).toBeLessThan(AT_BOTTOM_OK_PX)
+    expect(state.visible, 'the fastened message was left below the fold').toBe(true)
+  })
+})

@@ -24,6 +24,8 @@ import { createSlowCorrectionMonitor } from './slowCorrectionMonitor'
 import { createReassertLoopMonitor } from './reassertLoopMonitor'
 import type { ReassertLoopHandle } from './reassertLoopMonitor'
 import { createPinRunTracker, readPinRepaintMode, shouldForceRepaint } from './pinBottomRun'
+import { createPinLoopClaim, type PinLoopClaim } from './pinLoopClaim'
+import { decideRowGrowth } from './rowGrowthDecision'
 import { createPinRepaintBurst, pinBurstProbeLine, type PinRepaintBurst } from './pinRepaintBurst'
 import { createRenderCostProbe, type RenderCostProbe } from '@/utils/renderCostProbe'
 import { isProgrammaticScroll } from './scrollGate'
@@ -144,7 +146,7 @@ const CONTENT_ARRIVAL_TRIGGERS: ReadonlySet<string> = new Set([
   'new-message',
   'content-growth',
   'media-load',
-  'reaction',
+  'row-growth',
   'mam-catchup-complete',
 ])
 
@@ -291,11 +293,12 @@ export interface UseMessageListScrollOptions {
    *  ⇒ at the live edge — unchanged behavior. */
   windowAtLiveEdge?: boolean
   isHistoryComplete?: boolean
-  /** Signature of the reactions across the resident window. Changes when a reaction is added/removed on
-   *  ANY row (growing/shrinking it); drives an instant bottom re-pin while the reader is sticked to the
-   *  bottom, so the growth is absorbed above (previous messages scroll up) instead of shoving the
-   *  newest message down. */
-  reactionsSignature: string
+  /** Signature of every IN-PLACE row-height change across the resident window — a reaction, a
+   *  link-preview or attachment fastening, a correction, a retraction (see rowGrowthSignature.ts).
+   *  Any of them grows/shrinks a row that is already rendered; this drives an instant bottom re-pin
+   *  while the reader is sticked to the bottom, so the growth is absorbed above (previous messages
+   *  scroll up) instead of shoving the newest message down. */
+  rowGrowthSignature: string
   /** Whether the floating typing-indicator pill is currently shown. The footer reserves extra bottom
    *  padding to clear the pill only while this is true; the 0→true edge drives the same instant
    *  bottom re-pin as a reaction growing a row, gated on live geometry (see the reactions
@@ -381,7 +384,7 @@ export function useMessageListScroll({
   isLoadingNewer,
   windowAtLiveEdge,
   isHistoryComplete,
-  reactionsSignature,
+  rowGrowthSignature,
   hasTypingIndicator = false,
   lastMessageIsOutgoing = false,
   lastMessageId,
@@ -410,10 +413,15 @@ export function useMessageListScroll({
   // supersedes whatever is in flight so bottom, message, restore, media, and history targets cannot
   // fight over scrollTop. Single-flight: latest accepted generation wins with a fresh budget.
   const reassertLoopRef = useRef<{ raf: number; handle: ReassertLoopHandle } | null>(null)
-  // True while a pin-bottom re-assert loop is in flight. The typing/reactions re-pin defers to an
-  // active loop (it re-checks scrollHeight every frame and picks the change up itself) instead of
-  // restarting it — the restart's synchronous forced layout + repaint is the WebKitGTK hot path.
-  const pinBottomActiveRef = useRef(false)
+  // Whether a pin-bottom re-assert loop is in flight. The row-growth re-pin defers to an active loop
+  // (it re-checks scrollHeight every frame and picks the change up itself) instead of restarting it
+  // — the restart's synchronous forced layout + repaint is the WebKitGTK hot path. A self-expiring
+  // claim rather than a boolean, so a loop dropped without finishing cannot latch it: see
+  // pinLoopClaim.ts.
+  const pinBottomClaimRef = useRef<PinLoopClaim | null>(null)
+  // Same lazy-ref idiom as pinRunProbeRef / pinRepaintBurstRef below: a ref is stable, so reading it
+  // at the use sites keeps the exhaustive-deps rule satisfied without a dependency.
+  const pinBottomClaim = () => (pinBottomClaimRef.current ??= createPinLoopClaim())
   // Rate-limits the [PinLoopProbe] fluux.log line to one per cooldown (like RenderCostProbe).
   const pinRunProbeRef = useRef<RenderCostProbe | null>(null)
   // Coalesces forced repaints across a BURST of content-arrival pins (each superseding the last).
@@ -430,7 +438,7 @@ export function useMessageListScroll({
       reassertLoopRef.current.handle.end()
       reassertLoopRef.current = null
     }
-    pinBottomActiveRef.current = false
+    pinBottomClaimRef.current?.release()
   })
 
   // Track scroll position - always create internal ref to follow rules of hooks
@@ -1015,12 +1023,18 @@ export function useMessageListScroll({
       beginLoop: (lease) => {
         const loop = beginControllerFrameLoop('pin-bottom', lease)
         if (!loop) return null
-        pinBottomActiveRef.current = true
+        pinBottomClaim().renew()
         return {
           ...loop,
+          // Every frame the loop actually runs renews the claim, so it stays held for as long as
+          // the loop lives — and expires on its own if the loop is ever dropped without finishing.
+          recordFrame: (wrote: boolean) => {
+            pinBottomClaim().renew()
+            loop.recordFrame(wrote)
+          },
           finish: () => {
             loop.finish()
-            pinBottomActiveRef.current = false
+            pinBottomClaim().release()
           },
         }
       },
@@ -2386,7 +2400,7 @@ export function useMessageListScroll({
     // scrollTop: on WebKit a tall bottom row's post-paint growth fires 'scroll' events reporting a
     // transiently large distFromBottom before the loop re-pins, which would otherwise flash the FAB
     // on open-at-bottom (intermittent race). The loop settles AT the bottom, so the FAB stays hidden.
-    const shouldShowFab = shouldShowScrollToBottomFab(distFromBottom, FAB_THRESHOLD, pinBottomActiveRef.current)
+    const shouldShowFab = shouldShowScrollToBottomFab(distFromBottom, FAB_THRESHOLD, pinBottomClaim().isHeld())
     setShowScrollToBottom(prev => prev !== shouldShowFab ? shouldShowFab : prev)
 
     // Jump-to-last-read pill visibility: is the first-new-message divider currently scrolled
@@ -3347,14 +3361,18 @@ export function useMessageListScroll({
   }, [firstNewMessageId])
 
   // ==========================================================================
-  // EFFECT: Reaction added/removed — keep the bottom glued (only when sticked)
+  // EFFECT: A resident row grew in place — keep the bottom glued (only when sticked)
   // ==========================================================================
 
-  // A reaction grows (or shrinks) its message row. While the reader is sticked to the bottom we keep
-  // the newest message glued to the bottom edge and let the growth be absorbed ABOVE (previous
-  // messages scroll up) — rather than letting the row growth shove the newest message down. This runs
-  // for a reaction on ANY resident row, not just the last one: a reaction in the middle of the
-  // viewport would otherwise push everything below it (including the newest message) down.
+  // A reaction, a link-preview or attachment fastening, a correction or a retraction grows (or
+  // shrinks) a message row that is ALREADY rendered — without changing the message count or the
+  // last-message id, so the new-message effect never sees it. The OGP fastening is the slowest of
+  // them: it lands seconds after the send, once the metadata fetch and the round-trip complete.
+  // While the reader is sticked to the bottom we keep the newest message glued to the bottom edge
+  // and let the growth be absorbed ABOVE (previous messages scroll up) — rather than letting the row
+  // growth shove the newest message down. This runs for a change on ANY resident row, not just the
+  // last one: a row grown in the middle of the viewport would otherwise push everything below it
+  // (including the newest message) down.
   //
   // We route through the controller-owned live-edge convergence that new
   // messages and the typing footer use) rather than a one-shot scrollToIndex, because the row's
@@ -3363,30 +3381,64 @@ export function useMessageListScroll({
   // scrollHeight per frame and re-pins instantly (no smooth easing, so nothing visibly animates),
   // converging in a handful of frames. It's pure imperative scroll work — no React re-render.
   //
-  // Two safeguards keep it from ever fighting a scroll: (1) it's gated on LIVE geometry, not the
-  // latchable isAtBottomRef — a reader scrolled up into history reads distFromBottom >= threshold and
-  // is never re-pinned (a stale-true latch is what made a typing toggle "fight" the scroll in #918);
-  // (2) it fires only on an actual reactions change WITHIN the same conversation, so a conversation
-  // switch / restore is never disturbed.
-  const prevReactionsKeyRef = useRef(reactionsSignature)
-  const reactionsConvRef = useRef(conversationId)
+  // Two safeguards keep it from ever fighting a scroll: (1) it's gated on geometry, not the
+  // latchable isAtBottomRef — a reader scrolled up into history is never re-pinned (a stale-true
+  // latch is what made a typing toggle "fight" the scroll in #918); (2) it fires only on an actual
+  // row-height change WITHIN the same conversation, so a conversation switch / restore is never
+  // disturbed.
+  //
+  // The gate must read the geometry from BEFORE the growth, which is why it subtracts the height
+  // delta rather than measuring distance-from-bottom directly. By the time this layout effect runs
+  // the row has already grown, and that growth lands in the distance: a ~260px preview card reads as
+  // "260px from the bottom", i.e. further than the threshold, so a naive live-geometry gate refuses
+  // to re-pin the very case it exists for. Worse, the post-commit geometry is not even self
+  // consistent under virtualization — the grown row is absolutely positioned and overflows the
+  // @tanstack spacer, so the row can hang below the fold while scrollHeight (still the pre-growth
+  // spacer) reports a comfortable distance. Both engines reproduce this; see the fastening tests in
+  // scripts/scroll-invariants.ts. lastScrollDataRef is refreshed on every scroll event and by every
+  // bottom pin, so it is the last geometry the reader actually saw.
+  //
+  // A signature change is consumed EXACTLY ONCE — nothing re-runs this effect for the same
+  // signature — so every skip is final. That includes the skip taken while a pin loop already claims
+  // the bottom, which is a bet that the running loop absorbs the growth itself. The claim
+  // self-expires, so it can never latch permanently and suppress growths forever; but expiry does
+  // not replay a growth already consumed. See the accepted-gap contract on rowGrowthDecision.
+  const prevRowGrowthKeyRef = useRef(rowGrowthSignature)
+  const rowGrowthConvRef = useRef(conversationId)
+
   useLayoutEffect(() => {
-    const sameConversation = reactionsConvRef.current === conversationId
-    reactionsConvRef.current = conversationId
-    const prevKey = prevReactionsKeyRef.current
-    prevReactionsKeyRef.current = reactionsSignature
+    const sameConversation = rowGrowthConvRef.current === conversationId
+    rowGrowthConvRef.current = conversationId
+    const prevKey = prevRowGrowthKeyRef.current
+    prevRowGrowthKeyRef.current = rowGrowthSignature
     if (!sameConversation) return // conversation switch → rebaseline, never re-pin
-    if (prevKey === reactionsSignature) return // no actual reactions change (unrelated re-render)
+    if (prevKey === rowGrowthSignature) return // no actual row change (unrelated re-render)
 
     const scroller = scrollerRef.current
     if (!scroller || staticMode) return
-    // Live-geometry gate: only re-pin when genuinely at/near the bottom right now.
-    if (getDistanceFromBottom(scroller) >= AT_BOTTOM_THRESHOLD) return
-    // A running pin loop already keeps the bottom pinned — don't stack a second one.
-    if (pinBottomActiveRef.current) return
 
-    reconcileLiveEdge('reaction')
-  }, [reactionsSignature, conversationId, reconcileLiveEdge, staticMode])
+    // Measure against the last geometry the reader actually saw, and keep the SIGN. A mounted list
+    // is always at least a viewport tall, so a smaller baseline is a stale or not-yet-measured
+    // snapshot — report null rather than a number, so the decision treats it as "unknown" instead of
+    // trusting it. Trusting a bogus baseline would inflate the delta and make a scrolled-up reader
+    // look as if they had been at the bottom, which is the harmful direction.
+    const baseline = lastScrollDataRef.current?.height ?? 0
+    const active = positioningControllerRef.current?.snapshot().active
+    const decision = decideRowGrowth({
+      distanceFromBottom: getDistanceFromBottom(scroller),
+      heightDelta:
+        baseline >= scroller.clientHeight ? scroller.scrollHeight - baseline : null,
+      atBottomThreshold: AT_BOTTOM_THRESHOLD,
+      pinClaimHeld: pinBottomClaim().isHeld(),
+      navigationInFlight: Boolean(
+        active &&
+        active.request.conversationId === activeConversationIdRef.current &&
+        active.request.desired.kind !== 'live-edge' &&
+        active.phase.kind !== 'settled',
+      ),
+    })
+    if (decision === 'pin') reconcileLiveEdgeRef.current('row-growth')
+  }, [rowGrowthSignature, conversationId, staticMode])
 
   // ==========================================================================
   // EFFECT: Typing indicator appears — reveal its footer clearance while sticked
