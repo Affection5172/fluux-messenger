@@ -2,9 +2,16 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import { chatStore, _resetChatArchiveSavesForTesting } from './chatStore'
 import type { Message, Conversation } from '../core/types'
 import { getLocalPart } from '../core/jid'
-import { _resetStorageScopeForTesting, setStorageScopeJid } from '../utils/storageScope'
+import { _resetStorageScopeForTesting, setStorageScopeJid, getStorageScopeJid } from '../utils/storageScope'
 import { setResidentWindowSize } from './shared/residentWindow'
 import { selectCatchUpQuery } from '../utils/mamCatchUpUtils'
+import { _clearAllTransientForTesting, transientCounts } from './shared/transientUnread'
+import {
+  reportViewport,
+  currentViewportGeneration,
+  _clearAllViewportEvidenceForTesting,
+  type EvidenceKey,
+} from './shared/viewportEvidence'
 import { _resetForTesting, flush as flushThrottledStorage } from './shared/throttledStorage'
 
 // Mock localStorage
@@ -106,7 +113,27 @@ describe('chatStore', () => {
     vi.mocked(messageCache.saveMessages).mockResolvedValue(true)
     // A failed save poisons the per-conversation chain by design — drop it between tests.
     _resetChatArchiveSavesForTesting()
+    // The transient overlay is a module-level Map outside any store — guard
+    // against it leaking noted entries across `it()` blocks (roomStore's twin
+    // suite hit exactly this with fixed message ids reused across tests).
+    _clearAllTransientForTesting()
+    // Task 11: viewport evidence is ALSO a module-level Map outside any store —
+    // same leakage risk across `it()` blocks reusing the same conversation id.
+    _clearAllViewportEvidenceForTesting()
   })
+
+  /**
+   * Task 11: simulate the view reporting "genuinely at the live edge" for the
+   * CURRENT activation generation — mirrors what `ChatView`'s `reportLiveEdge`
+   * callback does in the real app after `setActiveConversation` runs. Tests
+   * that pre-date Task 11 assumed `isActive && windowVisible` alone meant
+   * "seen"; they now need this explicit report to keep that behavior, exactly
+   * as a real conversation genuinely parked at the bottom would produce it.
+   */
+  function reportAtLiveEdge(conversationId: string): void {
+    const key: EvidenceKey = { kind: 'chat', entityId: conversationId, accountScope: getStorageScopeJid() ?? '' }
+    reportViewport(key, currentViewportGeneration(key), 'at-edge')
+  }
 
   afterEach(() => {
     vi.clearAllMocks()
@@ -171,16 +198,27 @@ describe('chatStore', () => {
     // Regression: an encrypted reaction/retraction that arrives undecryptable
     // during catch-up is stored as a bodiless placeholder and counted as unread.
     // When a later deferred-decrypt reveals it was a signal and drops it, the
-    // unread badge must drop too. This method reconciles the count against the
-    // read pointer using the resident window (or the durable cache when the
-    // conversation was never opened).
+    // unread badge must drop too.
+    //
+    // PR B (archive-derived unread): this method no longer recomputes from a
+    // resident-window/cache SLICE — it derives the count from the durable
+    // archive, gated on proven MAM coverage down to the read floor (see
+    // chatStore.archiveUnread.test.ts for the full derivation matrix:
+    // exact/deferred/unavailable outcomes, latest-wins, mentionsCount
+    // preservation). Neither test below seeds `mamQueryStates`/
+    // `conversationCoverage`, so the entity is NOT proven caught-up — the
+    // derivation correctly DEFERS and the stale count survives untouched.
+    // That is deliberate: it demonstrates requirement 1 (discard the legacy
+    // count — deferred means "leave the last TRUSTED value alone", not "leave
+    // the last provisional slice-scan result alone") using this exact
+    // regression scenario.
     const cid = 'carol@example.com'
 
     function withId(m: Message, id: string, ts: string): Message {
       return { ...m, id, timestamp: new Date(ts) }
     }
 
-    it('recomputes the count from the resident window after a counted placeholder is dropped', async () => {
+    it('defers (leaves the stale count untouched) when coverage is not yet proven, even with the fix resident', async () => {
       const read = withId(createMessage(cid, 'read'), 'm-read', '2026-06-10T00:00:00Z')
       const realUnread = withId(createMessage(cid, 'still unread'), 'm-real', '2026-06-10T00:02:00Z')
       chatStore.getState().addConversation(createConversation(cid))
@@ -206,11 +244,14 @@ describe('chatStore', () => {
 
       await chatStore.getState().recomputeUnreadForConversation(cid)
 
-      expect(chatStore.getState().conversationMeta.get(cid)?.unreadCount).toBe(1)
-      expect(chatStore.getState().conversations.get(cid)?.unreadCount).toBe(1)
+      // No mamQueryStates/conversationCoverage seeded → not caught-up → deferred.
+      // The stale trusted value (2) survives; it is NOT recomputed to 1 from
+      // the resident array (that would be the OLD, now-removed, slice-scan).
+      expect(chatStore.getState().conversationMeta.get(cid)?.unreadCount).toBe(2)
+      expect(chatStore.getState().conversations.get(cid)?.unreadCount).toBe(2)
     })
 
-    it('recomputes from the durable cache when the conversation is not resident', async () => {
+    it('defers (leaves the stale count untouched) when the conversation is not resident and coverage is not proven', async () => {
       const read = withId(createMessage(cid, 'read'), 'm-read', '2026-06-10T00:00:00Z')
       const realUnread = withId(createMessage(cid, 'still unread'), 'm-real', '2026-06-10T00:02:00Z')
       vi.mocked(messageCache.getMessages).mockResolvedValueOnce([read, realUnread])
@@ -234,7 +275,7 @@ describe('chatStore', () => {
 
       await chatStore.getState().recomputeUnreadForConversation(cid)
 
-      expect(chatStore.getState().conversationMeta.get(cid)?.unreadCount).toBe(1)
+      expect(chatStore.getState().conversationMeta.get(cid)?.unreadCount).toBe(2)
     })
 
     it('does not touch the active conversation (activation owns its counts)', async () => {
@@ -922,13 +963,21 @@ describe('chatStore', () => {
       expect(chatStore.getState().activeConversationId).toBeNull()
     })
 
-    it('should mark conversation as read when set active', () => {
+    // Read-state PR B, final whole-branch-review FIX 2: this used to protect
+    // "activating a conversation force-zeroes unreadCount". That behaviour is
+    // removed — the canonical count is derived exclusively from the archive
+    // (recomputeUnreadForConversation) and converges to 0 only through Task
+    // 11's live-edge convergence, never as a side effect of merely opening the
+    // conversation (which used to race ahead of the divider, leaving a "New
+    // messages" marker next to a count of 0). This test now protects the
+    // opposite: setActiveConversation must leave the count untouched.
+    it('does not zero unreadCount when set active (count is archive-derived)', () => {
       const conv = { ...createConversation('alice@example.com'), unreadCount: 5 }
       chatStore.getState().addConversation(conv)
 
       chatStore.getState().setActiveConversation('alice@example.com')
 
-      expect(chatStore.getState().conversations.get('alice@example.com')?.unreadCount).toBe(0)
+      expect(chatStore.getState().conversations.get('alice@example.com')?.unreadCount).toBe(5)
     })
   })
 
@@ -1193,7 +1242,24 @@ describe('chatStore', () => {
       expect(conv?.unreadCount).toBe(1)
     })
 
-    it('should not increment unreadCount when conversation is active', () => {
+    it('should not increment unreadCount when conversation is active AND at the live edge', () => {
+      chatStore.getState().addConversation(createConversation('alice@example.com'))
+      chatStore.getState().setActiveConversation('alice@example.com')
+      // Task 11: "active" alone is no longer sufficient — the view must also have
+      // reported the viewport as genuinely at the live edge for THIS activation.
+      reportAtLiveEdge('alice@example.com')
+
+      chatStore.getState().addMessage(createMessage('alice@example.com', 'Hi', false))
+      chatStore.getState().addMessage(createMessage('alice@example.com', 'Hello', false))
+
+      const conv = chatStore.getState().conversations.get('alice@example.com')
+      expect(conv?.unreadCount).toBe(0)
+    })
+
+    it('increments unreadCount when conversation is active but the viewport has never reported (Task 11 regression control)', () => {
+      // The negative control this task exists for: active is NOT enough on its own
+      // anymore. Without a live-edge report, an active conversation must behave
+      // like any other unseen arrival.
       chatStore.getState().addConversation(createConversation('alice@example.com'))
       chatStore.getState().setActiveConversation('alice@example.com')
 
@@ -1201,7 +1267,7 @@ describe('chatStore', () => {
       chatStore.getState().addMessage(createMessage('alice@example.com', 'Hello', false))
 
       const conv = chatStore.getState().conversations.get('alice@example.com')
-      expect(conv?.unreadCount).toBe(0)
+      expect(conv?.unreadCount).toBe(2)
     })
 
     it('should return messages for active conversation via activeMessages', () => {
@@ -1415,6 +1481,112 @@ describe('chatStore', () => {
 
       const conv = chatStore.getState().conversations.get('alice@example.com')
       expect(conv?.unreadCount).toBe(1)
+    })
+
+    describe('Task 9 — transient overlay wiring', () => {
+      it('registers a renderable noLocalStore message in the transient overlay, not just the badge', () => {
+        const CONV = 'overlay@example.com'
+        chatStore.getState().addConversation(createConversation(CONV))
+        const msg = { ...createMessage(CONV, 'Ephemeral', false), noLocalStore: true }
+
+        chatStore.getState().addMessage(msg)
+
+        expect(chatStore.getState().conversations.get(CONV)?.unreadCount).toBe(1)
+        // Proves the entry actually landed in the overlay — not merely a bare
+        // `+1` somewhere else — by querying the overlay's own primitive
+        // directly, the same one the archive-derived recompute reads.
+        expect(
+          transientCounts({ accountScope: getStorageScopeJid() ?? '', kind: 'chat', entityId: CONV }, undefined).unread
+        ).toBe(1)
+      })
+
+      it('does not increment unreadCount again when the identical noLocalStore message is re-delivered', () => {
+        const CONV = 'overlay2@example.com'
+        chatStore.getState().addConversation(createConversation(CONV))
+        const msg = { ...createMessage(CONV, 'Ephemeral', false), noLocalStore: true }
+
+        chatStore.getState().addMessage(msg)
+        expect(chatStore.getState().conversations.get(CONV)?.unreadCount).toBe(1)
+
+        // Simulate the resident window having evicted the first copy (memory
+        // windowing / a backgrounded conversation) — the overlay itself is
+        // NEVER cleared on deactivation, so it is the only thing standing
+        // between this redelivery and a double count. Without this eviction,
+        // the TIMELINE's own dedupe (appendLive, keyed off the same bare id)
+        // would already catch the duplicate before the overlay's `added` gate
+        // is ever consulted — making the control hollow.
+        chatStore.setState((state) => {
+          const messages = new Map(state.messages)
+          messages.set(CONV, [])
+          return { messages }
+        })
+
+        // Re-deliver the EXACT same message (e.g. a duplicate carbon/echo).
+        // Chat identity has no tiers (unlike rooms) — it is the bare id — so
+        // this is the chat-side twin of the room's alias-re-delivery control:
+        // `noteTransient` resolves it to the SAME entry (`added: false`), so
+        // the badge must not double-count it.
+        chatStore.getState().addMessage({ ...msg })
+        expect(chatStore.getState().conversations.get(CONV)?.unreadCount).toBe(1)
+      })
+
+      it('prunes the overlay entry once markReadToNewest passes it (memory bound, not correctness)', () => {
+        const CONV = 'overlay3@example.com'
+        chatStore.getState().addConversation(createConversation(CONV))
+        const msg = { ...createMessage(CONV, 'Ephemeral', false), noLocalStore: true }
+        chatStore.getState().addMessage(msg)
+        const key = { accountScope: getStorageScopeJid() ?? '', kind: 'chat' as const, entityId: CONV }
+        expect(transientCounts(key, undefined).unread).toBe(1)
+
+        chatStore.getState().markReadToNewest(CONV)
+
+        expect(transientCounts(key, undefined).unread).toBe(0)
+      })
+
+      it('removes the overlay entry when the message is retracted, and schedules a recount', () => {
+        const CONV = 'overlay4@example.com'
+        chatStore.getState().addConversation(createConversation(CONV))
+        const msg = { ...createMessage(CONV, 'Ephemeral', false), noLocalStore: true }
+        chatStore.getState().addMessage(msg)
+        const key = { accountScope: getStorageScopeJid() ?? '', kind: 'chat' as const, entityId: CONV }
+        expect(transientCounts(key, undefined).unread).toBe(1)
+
+        const recomputeSpy = vi.spyOn(chatStore.getState(), 'recomputeUnreadForConversation').mockResolvedValue(undefined)
+
+        chatStore.getState().updateMessage(CONV, msg.id, { isRetracted: true, retractedAt: new Date() })
+
+        expect(transientCounts(key, undefined).unread).toBe(0)
+        expect(recomputeSpy).toHaveBeenCalledWith(CONV)
+
+        recomputeSpy.mockRestore()
+      })
+
+      it('clears the outgoing account transient overlay on switchAccount, and the current account on reset', () => {
+        setStorageScopeJid('alice@example.com')
+        chatStore.getState().switchAccount('alice@example.com')
+        chatStore.getState().addConversation(createConversation('overlay5@example.com'))
+        const aliceMsg = { ...createMessage('overlay5@example.com', 'Ephemeral', false), noLocalStore: true }
+        chatStore.getState().addMessage(aliceMsg)
+        const aliceKey = { accountScope: 'alice@example.com', kind: 'chat' as const, entityId: 'overlay5@example.com' }
+        expect(transientCounts(aliceKey, undefined).unread).toBe(1)
+
+        setStorageScopeJid('carol@example.com')
+        chatStore.getState().switchAccount('carol@example.com')
+
+        expect(transientCounts(aliceKey, undefined).unread).toBe(0)
+
+        chatStore.getState().addConversation(createConversation('overlay5@example.com'))
+        const carolMsg = { ...createMessage('overlay5@example.com', 'Ephemeral', false), noLocalStore: true }
+        chatStore.getState().addMessage(carolMsg)
+        const carolKey = { accountScope: 'carol@example.com', kind: 'chat' as const, entityId: 'overlay5@example.com' }
+        expect(transientCounts(carolKey, undefined).unread).toBe(1)
+
+        chatStore.getState().reset()
+
+        expect(transientCounts(carolKey, undefined).unread).toBe(0)
+
+        _resetStorageScopeForTesting()
+      })
     })
   })
 
@@ -1683,7 +1855,7 @@ describe('chatStore', () => {
       const conv = chatStore.getState().conversations.get('alice@example.com')
       expect(conv?.unreadCount).toBe(0)
       // The whole position moved to msg1 — id and timestamp together.
-      expect(conv?.readPointer).toEqual({ messageId: 'msg1', timestamp: messageTimestamp })
+      expect(conv?.readPointer).toMatchObject({ messageId: 'msg1', timestamp: messageTimestamp })
     })
 
     // Replaces 'should set lastReadAt to current time when no messages exist'
@@ -1726,7 +1898,7 @@ describe('chatStore', () => {
       chatStore.getState().markAsRead('alice@example.com')
 
       const conv = chatStore.getState().conversations.get('alice@example.com')
-      expect(conv?.readPointer).toEqual({ messageId: 'msg1', timestamp: messageTimestamp })
+      expect(conv?.readPointer).toMatchObject({ messageId: 'msg1', timestamp: messageTimestamp })
     })
 
     it('should not trigger state update when called twice at the same read position (regression test for infinite loop)', () => {
@@ -1751,7 +1923,7 @@ describe('chatStore', () => {
       chatStore.getState().markAsRead('alice@example.com')
       const convAfterFirst = chatStore.getState().conversations.get('alice@example.com')
       expect(convAfterFirst?.unreadCount).toBe(0)
-      expect(convAfterFirst?.readPointer).toEqual({ messageId: 'msg1', timestamp: messageTimestamp })
+      expect(convAfterFirst?.readPointer).toMatchObject({ messageId: 'msg1', timestamp: messageTimestamp })
 
       // Capture conversation reference after first markAsRead
       const conversationsMapAfterFirst = chatStore.getState().conversations
@@ -2692,14 +2864,15 @@ describe('chatStore', () => {
       chatStore.getState().addConversation(createConversation('alice@example.com'))
       chatStore.getState().addConversation(createConversation('bob@example.com'))
 
-      // View Alice's conversation
+      // View Alice's conversation, genuinely at the live edge (Task 11).
       chatStore.getState().setActiveConversation('alice@example.com')
+      reportAtLiveEdge('alice@example.com')
 
       // Messages to inactive conversation should increment unread
       chatStore.getState().addMessage(createMessage('bob@example.com', 'Hi from Bob'))
       chatStore.getState().addMessage(createMessage('bob@example.com', 'Another message'))
 
-      // Messages to active conversation should not increment unread
+      // Messages to active conversation (at the live edge) should not increment unread
       chatStore.getState().addMessage(createMessage('alice@example.com', 'Hi Alice'))
 
       expect(chatStore.getState().conversations.get('bob@example.com')?.unreadCount).toBe(2)
@@ -3564,14 +3737,29 @@ describe('chatStore', () => {
       chatStore.setState({ activeConversationId: 'other@example.com' })
     })
 
-    it('forward merge into a non-active conversation recomputes unread count from the pointer', () => {
+    // PR B: a forward merge into a non-active conversation no longer writes a
+    // page-scoped count synchronously — it schedules recomputeUnreadForConversation
+    // (fire-and-forget), which derives the badge from the durable archive instead
+    // (see chatStore.archiveUnread.test.ts for the exact-outcome path). With no
+    // mamQueryStates/conversationCoverage seeded here, that derivation defers,
+    // so the count stays at its seeded stale value (5, chosen to differ from
+    // the page's own tally of 2) rather than snapping to this page's own tally
+    // (2) — proving the page-scoped write is really gone, and that a broken
+    // defer gate would visibly overwrite the stale value.
+    it('forward merge into a non-active conversation defers the count until coverage is proven (no page-scoped write)', async () => {
       chatStore.setState((state) => {
         const meta = new Map(state.conversationMeta)
         meta.set(conversationId, {
           ...meta.get(conversationId)!,
+          // Distinguishing nonzero stale count — NOT equal to the page's own
+          // tally of 2 unread messages (m2, m3) — so a broken defer gate that
+          // commits the derived count instead of returning early fails loudly.
+          unreadCount: 5,
           readPointer: { messageId: 'm1', timestamp: new Date('2025-01-10T10:00:00Z') },
         })
-        return { conversationMeta: meta }
+        const convs = new Map(state.conversations)
+        convs.set(conversationId, { ...convs.get(conversationId)!, unreadCount: 5 })
+        return { conversationMeta: meta, conversations: convs }
       })
 
       const mamMessages: Message[] = [
@@ -3609,11 +3797,14 @@ describe('chatStore', () => {
 
       chatStore.getState().mergeMAMMessages(conversationId, mamMessages, {}, true, 'forward')
 
+      // Let the fire-and-forget archive recount run to completion.
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
       const meta = chatStore.getState().conversationMeta.get(conversationId)
-      expect(meta?.unreadCount).toBe(2)
+      expect(meta?.unreadCount).toBe(5)
       // Combined map mirrors meta.
       const conv = chatStore.getState().conversations.get(conversationId)
-      expect(conv?.unreadCount).toBe(2)
+      expect(conv?.unreadCount).toBe(5)
     })
 
     it('forward merge into a conversation with NO read state snaps the pointer (fresh-join guard)', () => {

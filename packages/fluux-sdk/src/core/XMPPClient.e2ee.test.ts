@@ -26,6 +26,13 @@ vi.mock('../utils/messageCache', () => ({
   getMessagesWithEncryptedPayload: vi.fn().mockResolvedValue([]),
   getMessage: vi.fn().mockResolvedValue(null),
   getMessageByStanzaId: vi.fn().mockResolvedValue(null),
+  // PR B (archive-derived unread): recomputeUnreadForConversation's coverage
+  // gate resolves the coverage bottom and counts through these — tests that
+  // exercise the phantom-badge fix past the gate override them.
+  countUnreadInArchive: vi.fn().mockResolvedValue({ unread: 0 }),
+  // PR B (Task 8): recomputeUnreadForRoom's room counterpart.
+  countRoomUnreadInArchive: vi.fn().mockResolvedValue({ unread: 0 }),
+  resolveArchivePosition: vi.fn().mockResolvedValue(null),
   updateMessage: vi.fn().mockResolvedValue(undefined),
   updateMessageReactions: vi.fn().mockResolvedValue(false),
   deleteMessage: vi.fn().mockResolvedValue(undefined),
@@ -47,6 +54,7 @@ vi.mock('../utils/messageCache', () => ({
 
 import { XMPPClient } from './XMPPClient'
 import { chatStore } from '../stores/chatStore'
+import { roomStore } from '../stores/roomStore'
 import {
   E2EEManager,
   E2EEPluginError,
@@ -91,6 +99,7 @@ describe('XMPPClient.retryPendingDecrypts()', () => {
   beforeEach(async () => {
     _resetStorageScopeForTesting()
     chatStore.getState().reset()
+    roomStore.getState().reset()
     manager = await makeManagerWithDummyPlugin('me@example.com')
     xmppClient = new XMPPClient({ debug: false })
     // e2ee is a public field, normally set in handleConnectionSuccess
@@ -102,6 +111,7 @@ describe('XMPPClient.retryPendingDecrypts()', () => {
   afterEach(() => {
     vi.clearAllMocks()
     chatStore.getState().reset()
+    roomStore.getState().reset()
   })
 
   describe('unsupported-encryption self-heal', () => {
@@ -613,21 +623,54 @@ describe('XMPPClient.retryPendingDecrypts()', () => {
       })
       // Model the catch-up state: read pointer at 'read-msg', with the two later
       // incoming messages (the real one + the phantom reaction) counted as unread.
+      //
+      // PR B (archive-derived unread): recomputeUnreadForConversation now
+      // derives the corrected count from the durable archive instead of the
+      // resident window, gated on proven MAM coverage — so this also models a
+      // conversation whose catch-up already completed (isCaughtUpToLive, a
+      // coverage record whose bottom resolves at-or-before the floor), which
+      // is the realistic state by the time a deferred decrypt runs. Without
+      // this the derivation would correctly DEFER (see chatStore.test.ts's
+      // "phantom-badge cleanup" describe for that control) and the badge
+      // fix below would not apply — this test proves the fix survives PR B.
+      const readPointer = {
+        messageId: 'read-msg',
+        timestamp: new Date('2026-06-10T00:00:00Z'),
+        archiveOrderKey: { kind: 'chat' as const, id: 'read-msg' },
+      }
       chatStore.setState((s) => {
         const conversationMeta = new Map(s.conversationMeta)
         conversationMeta.set('bob@example.com', {
           ...conversationMeta.get('bob@example.com')!,
           unreadCount: 2,
-          readPointer: { messageId: 'read-msg', timestamp: new Date('2026-06-10T00:00:00Z') },
+          readPointer,
         })
         const conversations = new Map(s.conversations)
         conversations.set('bob@example.com', {
           ...conversations.get('bob@example.com')!,
           unreadCount: 2,
-          readPointer: { messageId: 'read-msg', timestamp: new Date('2026-06-10T00:00:00Z') },
+          readPointer,
         })
-        return { conversationMeta, conversations, activeConversationId: null }
+        const mamQueryStates = new Map(s.mamQueryStates)
+        mamQueryStates.set('bob@example.com', {
+          isLoading: false,
+          error: null,
+          hasQueried: true,
+          isHistoryComplete: true,
+          isCaughtUpToLive: true,
+        })
+        const conversationCoverage = new Map(s.conversationCoverage)
+        conversationCoverage.set('bob@example.com', { bottomId: 'archive-anchor' })
+        return { conversationMeta, conversations, mamQueryStates, conversationCoverage, activeConversationId: null }
       })
+      // The coverage record's bottom resolves to a position strictly before
+      // the floor (proving coverage reaches at least that far back).
+      vi.mocked(messageCache.resolveArchivePosition).mockResolvedValueOnce({
+        timestamp: new Date('2026-06-09T23:00:00Z').getTime(),
+        archiveOrderKey: { kind: 'chat', id: 'archive-anchor' },
+      })
+      // Only the genuinely-unread message remains once the reaction ghost drops.
+      vi.mocked(messageCache.countUnreadInArchive).mockResolvedValueOnce({ unread: 1 })
 
       await xmppClient.retryPendingDecrypts()
 
@@ -816,6 +859,94 @@ describe('XMPPClient.retryPendingDecrypts()', () => {
       expect(msg?.isEdited).toBe(true)
       expect(msg?.originalBody).toBe('the original text')
       expect(msg?.encryptedPayload).toBeUndefined()
+    })
+  })
+
+  describe('deferred-decrypt room recount (Task 8)', () => {
+    // The room-side gap this task closes: before Task 8, retryPending()
+    // resolved an encrypted room message (decrypted / rejected / unsupported)
+    // but called NO recount — recomputeUnreadForRoom did not exist. A room's
+    // badge can be stale for reasons unrelated to any one message (a prior
+    // recount deferred, a stale persisted value from a previous session); the
+    // moment an encrypted placeholder in the room resolves is exactly the
+    // wiring's chance to reconcile it against the durable archive. This models
+    // that: the room's badge is inflated (5) relative to the true
+    // archive-derived count (1), and resolving the one stashed encrypted
+    // message triggers recomputeUnreadForRoom, which corrects it.
+    const ROOM = 'lounge@conference.example.com'
+
+    it('a resolved encrypted room message triggers the recount, correcting an inflated badge', async () => {
+      // DummyPlaintextPlugin always reports trust:'untrusted' (it can't
+      // verify signatures), which decryptStanzaInPlace treats as "needs
+      // deferred re-verification" and re-stashes — so, like every other test
+      // in this file that needs a completed decrypt, override the trust to
+      // 'verified' so the outcome actually commits.
+      vi.spyOn(manager, 'decryptArchive').mockResolvedValue({
+        plaintext: new TextEncoder().encode('hello'),
+        senderDevice: { jid: `${ROOM}/bob`, deviceId: 'test' },
+        securityContext: { protocolId: 'dummy-plaintext', trust: 'verified' },
+      })
+
+      roomStore.getState().addRoom({
+        jid: ROOM,
+        name: 'Lounge',
+        nickname: 'me',
+        joined: true,
+        isBookmarked: false,
+        occupants: new Map(),
+        messages: [{
+          type: 'groupchat',
+          id: 'enc-1',
+          roomJid: ROOM,
+          from: `${ROOM}/bob`,
+          nick: 'bob',
+          body: '[Encrypted message: could not decrypt]',
+          timestamp: new Date('2026-06-10T00:02:00Z'),
+          isOutgoing: false,
+          encryptedPayload: DUMMY_PAYLOAD_XML,
+        }],
+        unreadCount: 0,
+        mentionsCount: 0,
+        typingUsers: new Set(),
+      })
+
+      // Model catch-up already complete, with a resolvable coverage bottom —
+      // the realistic state by the time a deferred decrypt runs — and a
+      // badge that is currently stale/inflated relative to the truth.
+      const readPointer = {
+        messageId: 'read-msg',
+        timestamp: new Date('2026-06-10T00:00:00Z'),
+        archiveOrderKey: { kind: 'room' as const, from: `${ROOM}/alice`, id: 'read-msg' },
+      }
+      roomStore.setState((s) => {
+        const roomMeta = new Map(s.roomMeta)
+        roomMeta.set(ROOM, { ...roomMeta.get(ROOM)!, unreadCount: 5, readPointer })
+        const rooms = new Map(s.rooms)
+        rooms.set(ROOM, { ...rooms.get(ROOM)!, unreadCount: 5, readPointer })
+        const mamQueryStates = new Map(s.mamQueryStates)
+        mamQueryStates.set(ROOM, {
+          isLoading: false, error: null, hasQueried: true, isHistoryComplete: true, isCaughtUpToLive: true,
+        })
+        const roomCoverage = new Map(s.roomCoverage)
+        roomCoverage.set(ROOM, { bottomId: 'archive-anchor' })
+        return { roomMeta, rooms, mamQueryStates, roomCoverage, activeRoomJid: null }
+      })
+      // The coverage record's bottom resolves to a position strictly before
+      // the floor (proving coverage reaches at least that far back).
+      vi.mocked(messageCache.resolveArchivePosition).mockResolvedValueOnce({
+        timestamp: new Date('2026-06-09T23:00:00Z').getTime(),
+        archiveOrderKey: { kind: 'room', from: `${ROOM}/alice`, id: 'archive-anchor' },
+      })
+      // Only one message is genuinely unread once the archive is consulted.
+      vi.mocked(messageCache.countRoomUnreadInArchive).mockResolvedValueOnce({ unread: 1 })
+
+      await xmppClient.retryPendingDecrypts()
+
+      const messages = roomStore.getState().rooms.get(ROOM)?.messages ?? []
+      expect(messages.find((m) => m.id === 'enc-1')?.body).toBe('hello')
+      expect(messages.find((m) => m.id === 'enc-1')?.encryptedPayload).toBeUndefined()
+      // The inflated badge is corrected once the recount is triggered.
+      expect(roomStore.getState().roomMeta.get(ROOM)?.unreadCount).toBe(1)
     })
   })
 

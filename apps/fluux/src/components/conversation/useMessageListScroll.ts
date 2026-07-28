@@ -321,6 +321,22 @@ export interface UseMessageListScrollOptions {
    *  of reading the DOM directly — so it works for unmounted rows. Absent → unchanged
    *  DOM-based behavior. Wired in Task 7. */
   virtualizer?: MessageVirtualizer
+  /**
+   * Read-state PR B, Task 11: reports whether the viewport is genuinely at the
+   * live edge, invoked EVERY time `isAtBottomRef.current` is assigned from a
+   * REAL measured geometry read (a `scrollHeight - scrollTop - clientHeight`
+   * comparison against `AT_BOTTOM_THRESHOLD`, taken after the scroll write it
+   * describes has already landed) — never from an assumed/decided default.
+   *
+   * Deliberately NOT invoked from `rememberBottomIntent` (which sets
+   * `isAtBottomRef.current = true` unconditionally on a deliberate
+   * scroll-to-bottom action) or from the conversation-switch entry effect's
+   * pre-measurement guesses (`isAtBottomRef.current = true/false` before the
+   * positioning executor has actually run) — those are exactly the unsafe
+   * stale defaults this option exists to avoid feeding to the SDK: evidence
+   * must stay `unknown` until the geometry has actually been read.
+   */
+  onLiveEdgeMeasured?: (atEdge: boolean) => void
 }
 
 export interface UseMessageListScrollResult {
@@ -348,6 +364,32 @@ export interface UseMessageListScrollResult {
    *  pill's click handler; also the routine the conversation-switch entry effect uses. No-op when
    *  there is no current marker. */
   scrollToMarker: () => void
+  /**
+   * Read-state PR B, Task 12: capture a CONTENT anchor (the bottom-most visible message plus the
+   * fraction of its height at the viewport bottom) from the CURRENT scroller geometry. Exposes the
+   * module-private `findBottomAnchor` so callers (MessageList's divider live-tracking) can snapshot
+   * a pre-mutation anchor themselves, on their own cadence — see `restoreAnchor`'s doc for why the
+   * capture point has to be genuinely pre-mutation. Returns null when there's no scroller or no
+   * rendered message row (nothing to anchor to).
+   */
+  captureAnchor: () => ScrollAnchor | null
+  getLatestAnchor: () => ScrollAnchor | null
+  /**
+   * Read-state PR B, Task 12: restore the scroll position so the anchor message sits at the same
+   * fractional offset it was captured at, using the CURRENT scroller and the message's CURRENT
+   * measured height. Exposes the module-private `restoreToAnchor`.
+   *
+   * Why this needs to be a caller-driven pair rather than an effect keyed on the divider id: a
+   * `useLayoutEffect` keyed on `firstNewMessageId` runs after React has already committed the new
+   * divider into the DOM — reading geometry there is *post*-mutation, so there is nothing left to
+   * capture (the anchor message may already have shifted). The fix is a continuously-maintained
+   * anchor (`captureAnchor`, refreshed by the caller every render while the divider is unchanged)
+   * paired with a restore call in that same post-mutation, pre-paint layout effect — `restoreAnchor`
+   * writes `scrollTop` synchronously, so it still lands before the browser paints the mutated layout,
+   * even though the capture had to happen earlier. Returns false when the anchor message isn't
+   * currently mounted (so the caller can decide whether to fall back).
+   */
+  restoreAnchor: (anchor: ScrollAnchor) => boolean
 }
 
 interface DirectionalHistorySnapshot {
@@ -389,6 +431,7 @@ export function useMessageListScroll({
   lastMessageId,
   staticMode = false,
   virtualizer,
+  onLiveEdgeMeasured,
 }: UseMessageListScrollOptions): UseMessageListScrollResult {
 
   // ==========================================================================
@@ -443,6 +486,26 @@ export function useMessageListScroll({
   // Track scroll position - always create internal ref to follow rules of hooks
   const internalIsAtBottomRef = useRef(true)
   const isAtBottomRef = externalIsAtBottomRef || internalIsAtBottomRef
+
+  // Read-state PR B, Task 11: latest `onLiveEdgeMeasured` callback, read imperatively
+  // by `setMeasuredAtBottom` below (never closed over directly, so a caller passing a
+  // fresh inline function each render still reaches the CURRENT one).
+  const onLiveEdgeMeasuredRef = useRef(onLiveEdgeMeasured)
+  onLiveEdgeMeasuredRef.current = onLiveEdgeMeasured
+
+  // Set `isAtBottomRef` from a REAL measured geometry read, AND report that same
+  // measurement to the SDK's viewport-evidence channel (Task 11). Every call site
+  // below has just read `scrollHeight - scrollTop - clientHeight` (or an equivalent
+  // virtualizer-aware distance) against `AT_BOTTOM_THRESHOLD` — never an
+  // assumed/decided default. Must NOT be used for: `rememberBottomIntent` (sets
+  // `true` unconditionally on a deliberate scroll-to-bottom action) or the
+  // conversation-switch entry effect's pre-measurement guesses — see
+  // `UseMessageListScrollOptions.onLiveEdgeMeasured`'s doc for why those stay raw
+  // `isAtBottomRef.current = ...` assignments.
+  const setMeasuredAtBottom = useCallback((atEdge: boolean) => {
+    isAtBottomRef.current = atEdge
+    onLiveEdgeMeasuredRef.current?.(atEdge)
+  }, [isAtBottomRef])
 
   // Virtualizer ref updated synchronously in the render body (before any effects).
   // This ensures useLayoutEffect sees the CURRENT render's virtualizer (with updated
@@ -1155,8 +1218,7 @@ export function useMessageListScroll({
         }
 
         if (scroller) {
-          isAtBottomRef.current =
-            getDistanceFromBottom(scroller) < AT_BOTTOM_THRESHOLD
+          setMeasuredAtBottom(getDistanceFromBottom(scroller) < AT_BOTTOM_THRESHOLD)
           lastProgrammaticScrollAtRef.current = Date.now()
         }
         const probe = (pinRunProbeRef.current ??= createRenderCostProbe({
@@ -1175,12 +1237,12 @@ export function useMessageListScroll({
   }, [
     beginControllerFrameLoop,
     firstMessageId,
-    isAtBottomRef,
     isLoadingNewer,
     lastMessageId,
     messageCount,
     onLoadNewer,
     rememberBottomIntent,
+    setMeasuredAtBottom,
     windowAtLiveEdge,
   ])
 
@@ -1547,7 +1609,7 @@ export function useMessageListScroll({
     complete: (request, outcome) => {
       const scroller = scrollerRef.current
       if (!scroller) return
-      isAtBottomRef.current = getDistanceFromBottom(scroller) < AT_BOTTOM_THRESHOLD
+      setMeasuredAtBottom(getDistanceFromBottom(scroller) < AT_BOTTOM_THRESHOLD)
       rememberCurrentScrollSnapshot()
       lastProgrammaticScrollAtRef.current = Date.now()
       debugLog('RESTORE: controller completed position', {
@@ -1569,6 +1631,7 @@ export function useMessageListScroll({
     messageCount,
     onLoadNewer,
     rememberCurrentScrollSnapshot,
+    setMeasuredAtBottom,
     windowAtLiveEdge,
   ])
 
@@ -1639,7 +1702,7 @@ export function useMessageListScroll({
       const distanceFromBottom =
         scroller.scrollHeight - scrollTop - scroller.clientHeight
       const atLiveEdge = distanceFromBottom < AT_BOTTOM_THRESHOLD
-      isAtBottomRef.current = atLiveEdge
+      setMeasuredAtBottom(atLiveEdge)
       debugLog('UNREAD MARKER: controller positioned frame', {
         conversationId: request.conversationId,
         generation: request.generation,
@@ -1656,8 +1719,8 @@ export function useMessageListScroll({
     firstMessageId,
     beginControllerFrameLoop,
     createLiveEdgeExecutor,
-    isAtBottomRef,
     messageCount,
+    setMeasuredAtBottom,
     windowAtLiveEdge,
   ])
 
@@ -1742,7 +1805,7 @@ export function useMessageListScroll({
       const scrollTop = scroller.scrollTop
       const distanceFromBottom =
         scroller.scrollHeight - scrollTop - scroller.clientHeight
-      isAtBottomRef.current = distanceFromBottom < AT_BOTTOM_THRESHOLD
+      setMeasuredAtBottom(distanceFromBottom < AT_BOTTOM_THRESHOLD)
       debugLog('TARGET MESSAGE: controller positioned frame', {
         conversationId: request.conversationId,
         generation: request.generation,
@@ -1792,6 +1855,7 @@ export function useMessageListScroll({
     firstMessageId,
     isAtBottomRef,
     messageCount,
+    setMeasuredAtBottom,
     windowAtLiveEdge,
   ])
 
@@ -2383,7 +2447,7 @@ export function useMessageListScroll({
     const growthDrivenDuringLoop =
       programmaticScroll && prevScrollHeightRef.current !== null && scrollHeight > prevScrollHeightRef.current
     if (!growthDrivenDuringLoop) {
-      isAtBottomRef.current = distFromBottom < AT_BOTTOM_THRESHOLD
+      setMeasuredAtBottom(distFromBottom < AT_BOTTOM_THRESHOLD)
     }
 
     // Track user scroll during a media load batch — but ONLY a GENUINE user scroll, not the
@@ -3603,6 +3667,24 @@ export function useMessageListScroll({
     })
   }, [firstNewMessageId, conversationId, createUnreadMarkerExecutor])
 
+  // Read-state PR B, Task 12: caller-driven anchor capture/restore — see the return type's doc
+  // for why the capture point can't just be a layout effect keyed on the divider id.
+  const captureAnchor = useCallback((): ScrollAnchor | null => {
+    const scroller = scrollerRef.current
+    if (!scroller) return null
+    const anchor = findBottomAnchor(scroller)
+    lastAnchorRef.current = anchor
+    return anchor
+  }, [])
+
+  const getLatestAnchor = useCallback((): ScrollAnchor | null => lastAnchorRef.current, [])
+
+  const restoreAnchor = useCallback((anchor: ScrollAnchor): boolean => {
+    const scroller = scrollerRef.current
+    if (!scroller) return false
+    return restoreToAnchor(scroller, anchor)
+  }, [])
+
   // ==========================================================================
   // RETURN
   // ==========================================================================
@@ -3621,5 +3703,8 @@ export function useMessageListScroll({
     markerAboveViewport,
     bottomVisibleMessageId,
     scrollToMarker,
+    captureAnchor,
+    getLatestAnchor,
+    restoreAnchor,
   }
 }

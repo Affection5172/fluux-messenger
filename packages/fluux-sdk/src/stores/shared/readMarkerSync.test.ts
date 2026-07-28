@@ -34,7 +34,7 @@ function seenIn(id: string) {
 
 describe('resolveRemoteDisplayed', () => {
   it('stashes the stanza-id as a pending high-water mark when the message is not loaded', () => {
-    const result = resolveRemoteDisplayed(baseMeta, messages, undefined, 'arch-unknown', { isActive: false })
+    const result = resolveRemoteDisplayed(baseMeta, messages, undefined, 'arch-unknown', 'chat', { isActive: false })
 
     expect(result.kind).toBe('stash-pending')
   })
@@ -45,12 +45,15 @@ describe('resolveRemoteDisplayed', () => {
       messages,
       undefined,
       'arch-m2',
+      'chat',
       { isActive: false }
     )
 
     // Whole-object assertion: the resolution carries one read position, and its
-    // timestamp is the resolved message's own (#1081).
-    expect(result).toEqual({
+    // timestamp is the resolved message's own (#1081). toMatchObject rather
+    // than toEqual: the resolved pointer also carries an archiveOrderKey,
+    // which is not what this test is about.
+    expect(result).toMatchObject({
       kind: 'advanced',
       readPointer: { messageId: 'm2', timestamp: new Date('2024-01-15T10:02:00Z') },
     })
@@ -62,11 +65,12 @@ describe('resolveRemoteDisplayed', () => {
       messages,
       undefined,
       'arch-m2',
+      'chat',
       { isActive: true }
     )
 
     // Advanced to m2 → the first unseen incoming message after it is m3.
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       kind: 'advanced-with-divider',
       readPointer: { messageId: 'm2', timestamp: new Date('2024-01-15T10:02:00Z') },
       firstNewMessageId: 'm3',
@@ -79,10 +83,11 @@ describe('resolveRemoteDisplayed', () => {
       messages,
       'm2',
       'arch-m3',
+      'chat',
       { isActive: true }
     )
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       kind: 'advanced-with-divider',
       readPointer: { messageId: 'm3', timestamp: new Date('2024-01-15T10:03:00Z') },
       firstNewMessageId: undefined,
@@ -95,6 +100,7 @@ describe('resolveRemoteDisplayed', () => {
       messages,
       undefined,
       'arch-m2',
+      'chat',
       { isActive: false }
     )
 
@@ -107,6 +113,7 @@ describe('resolveRemoteDisplayed', () => {
       messages,
       undefined,
       'arch-m2',
+      'chat',
       { isActive: false }
     )
 
@@ -132,6 +139,7 @@ describe('resolveRemoteDisplayed', () => {
       messages,
       undefined,
       'arch-m3',
+      'chat',
       { isActive: false }
     )
 
@@ -155,6 +163,7 @@ describe('resolveRemoteDisplayed', () => {
       messages,
       undefined,
       'arch-m3',
+      'chat',
       { isActive: false }
     )
 
@@ -173,6 +182,7 @@ describe('resolveRemoteDisplayed', () => {
       messages,
       undefined,
       'arch-m3',
+      'chat',
       { isActive: false }
     )
 
@@ -191,6 +201,7 @@ describe('resolveRemoteDisplayed', () => {
       messages,
       undefined,
       'arch-m3',
+      'chat',
       { isActive: false }
     )
 
@@ -208,6 +219,7 @@ describe('resolveRemoteDisplayed', () => {
       messages,
       undefined,
       'arch-m3',
+      'chat',
       { isActive: false }
     )
 
@@ -226,6 +238,7 @@ describe('resolveRemoteDisplayed', () => {
       messages,
       'm2',
       'arch-m3',
+      'chat',
       { isActive: true }
     )
 
@@ -261,6 +274,7 @@ describe('resolveRemoteDisplayed', () => {
       latestPage,
       firstNewMessageId,
       pending,
+      'chat',
       { isActive: false }
     )
     expect(catchUp).toEqual({ kind: 'stash-pending' })
@@ -284,6 +298,7 @@ describe('resolveRemoteDisplayed', () => {
           fullHistory,
           firstNewMessageId,
           stanzaId,
+          'chat',
           { isActive: true }
         )
         expect(activated.kind).toBe('advanced-with-divider')

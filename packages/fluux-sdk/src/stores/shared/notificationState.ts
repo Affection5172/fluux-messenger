@@ -20,7 +20,8 @@
  * permanent (the pointer is forward-only).
  */
 
-import { makeReadPointer, type PointerSource, type ReadPointer } from './readPointer'
+import { advance, makeReadPointer, type PointerSource, type ReadPointer } from './readPointer'
+import { isRenderableStoredMessage, pointerlessDefers, type RenderabilityCheckFields } from './readState'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -67,13 +68,24 @@ export interface EntityNotificationState {
   firstNewMessageId?: string
 }
 
-/** Minimal message shape needed for notification decisions. */
-export interface NotificationMessage {
+/**
+ * Minimal message shape needed for notification decisions.
+ *
+ * Extends {@link RenderabilityCheckFields} (content fields, all optional) so
+ * the increment branch of {@link onMessageReceived} can gate on
+ * `isRenderableStoredMessage` directly — every existing caller already
+ * constructs these objects from a real `Message`/`RoomMessage`, or omits the
+ * content fields entirely (falling back to "not renderable", which is only
+ * consulted by the one branch that needs it).
+ */
+export interface NotificationMessage extends RenderabilityCheckFields {
   id: string
   timestamp: Date
   isOutgoing: boolean
   isDelayed?: boolean
   isMention?: boolean
+  /** Sender's JID — feeds the ROOM archive order key's (from, id) tie-break. */
+  from?: string
 }
 
 /** Context about the entity's current visibility and unread state. */
@@ -84,6 +96,19 @@ export interface EntityContext {
   unreadCount?: number
   /** The entity's read position; suppresses re-notify of already-seen content. */
   readPointer?: ReadPointer
+  /**
+   * Whether the viewport is DEMONSTRABLY at the live edge, for the CURRENT
+   * activation generation — derived by the store as
+   * `currentViewportEvidence(key) === 'at-edge'` (see `viewportEvidence.ts`).
+   *
+   * `undefined` (and any non-`true` value) is the safe default and means "not
+   * at the edge": missing / stale / unknown viewport evidence must never
+   * authorize {@link onMessageReceived} to advance the read pointer — an
+   * active, focused conversation scrolled up into history is exactly the case
+   * this field exists to distinguish from one genuinely parked at the bottom
+   * (read-state PR B, Task 11).
+   */
+  viewportAtLiveEdge?: boolean
 }
 
 /** Options for message-received notification handling. */
@@ -112,23 +137,35 @@ export interface MessageReceivedOptions {
  * - Delayed/historical: no changes (preserve existing state)
  * - Incoming + user sees message: no unread increment, advance the pointer
  * - Incoming + user doesn't see + entity active + window hidden: set marker if not set
- * - Incoming + user doesn't see + entity not active: increment unread, don't set marker
+ * - Incoming + user doesn't see + entity not active: increment unread (only when
+ *   the message is renderable — see `isRenderableStoredMessage`), don't set marker
+ *
+ * "User sees message" (Task 11) requires all three of: the entity is active,
+ * the window is visible/focused, AND the viewport is demonstrably at the live
+ * edge for the CURRENT activation generation (`ctx.viewportAtLiveEdge ===
+ * true`). An active, focused conversation the user has scrolled UP in is
+ * exactly the case this precondition exists to catch: `isActive &&
+ * windowVisible` alone used to advance the pointer there, silently marking
+ * unseen history as read. Missing/stale/unknown viewport evidence (the
+ * `undefined` default) is treated conservatively as NOT at the edge — see
+ * `EntityContext.viewportAtLiveEdge` and `viewportEvidence.ts`.
  */
 export function onMessageReceived(
   state: EntityNotificationState,
   msg: NotificationMessage,
   ctx: EntityContext,
+  kind: 'chat' | 'room',
   options?: MessageReceivedOptions
 ): EntityNotificationState {
   const { incrementUnread = true, incrementMentions = false, treatDelayedAsNew = false } = options ?? {}
-  const userSeesMessage = ctx.isActive && ctx.windowVisible
+  const userSeesMessage = ctx.isActive && ctx.windowVisible && ctx.viewportAtLiveEdge === true
 
   // Outgoing message: user is actively engaging, clear notification state
   if (msg.isOutgoing) {
     return {
       unreadCount: 0,
       mentionsCount: 0,
-      readPointer: makeReadPointer(msg),
+      readPointer: advance(state.readPointer, makeReadPointer(msg, kind)),
       firstNewMessageId: undefined,
     }
   }
@@ -148,13 +185,21 @@ export function onMessageReceived(
     return {
       unreadCount: 0,
       mentionsCount: 0,
-      readPointer: makeReadPointer(msg),
+      readPointer: advance(state.readPointer, makeReadPointer(msg, kind)),
       firstNewMessageId: state.firstNewMessageId,
     }
   }
 
-  // User doesn't see the message
-  const newUnreadCount = incrementUnread ? state.unreadCount + 1 : state.unreadCount
+  // User doesn't see the message. A message with nothing to display (a stray
+  // XEP-0333 marker, a XEP-0428-fallback-only body — see
+  // `isRenderableStoredMessage`) never becomes a visible bubble, so it must
+  // never inflate the badge either: that phantom `+1` is exactly the class of
+  // bug this guard closes. `noLocalStore` messages (never archived) are
+  // EXCLUDED from this ad hoc `+1` by the caller passing `incrementUnread:
+  // false` for them — their contribution comes entirely from the transient
+  // overlay (`stores/shared/transientUnread.ts`), wired at the chatStore/
+  // roomStore call sites, so it is never double-counted here.
+  const newUnreadCount = incrementUnread && isRenderableStoredMessage(msg) ? state.unreadCount + 1 : state.unreadCount
   const newMentionsCount = incrementMentions ? state.mentionsCount + 1 : state.mentionsCount
 
   // Set marker if: entity is active AND window hidden AND no existing marker
@@ -174,10 +219,50 @@ export function onMessageReceived(
 }
 
 /**
+ * Whether {@link onMessageReceived} would reach its final "user doesn't see
+ * the message" branch — i.e. treat `msg` as a genuine unseen arrival rather
+ * than short-circuiting on outgoing, delayed-historical, or seen-live.
+ *
+ * Exported so a caller that needs to gate a SIDE EFFECT on that exact same
+ * condition (the transient overlay's `noteTransient`, in chatStore/roomStore —
+ * see `stores/shared/transientUnread.ts`) mirrors this pure transition's own
+ * branching instead of re-deriving a similar-but-possibly-different check
+ * inline, which is exactly the kind of drift this module exists to prevent.
+ *
+ * `ctx.viewportAtLiveEdge` mirrors {@link onMessageReceived}'s own
+ * `userSeesMessage` three-way check EXACTLY (read-state PR B, final
+ * whole-branch-review FIX 6 — Task 11 added the viewport-evidence dimension
+ * to `onMessageReceived` but left this helper on the coarser `isActive &&
+ * windowVisible`, a deliberately-scoped gap at the time). An active,
+ * focused, but SCROLLED-UP conversation now correctly counts as unseen here
+ * too: `onMessageReceived` already does the live `+1` for it (it never
+ * advances the pointer without `viewportAtLiveEdge === true`), but a
+ * `noLocalStore` message can ONLY ever be represented by the transient
+ * overlay — it is never archived, so nothing else records it, and a later
+ * exact recount (deriving purely from the archive) would otherwise silently
+ * drop its contribution the moment it commits.
+ */
+export function isUnseenIncomingMessage(
+  msg: Pick<NotificationMessage, 'isOutgoing' | 'isDelayed'>,
+  ctx: Pick<EntityContext, 'isActive' | 'windowVisible' | 'viewportAtLiveEdge'>,
+  options?: { treatDelayedAsNew?: boolean }
+): boolean {
+  if (msg.isOutgoing) return false
+  if (msg.isDelayed && !(options?.treatDelayedAsNew ?? false)) return false
+  if (ctx.isActive && ctx.windowVisible && ctx.viewportAtLiveEdge === true) return false
+  return true
+}
+
+/**
  * Compute new notification state when user opens/activates an entity.
  *
  * Scans messages to find the first unseen message (after the read pointer)
- * and sets the marker, then marks as read.
+ * and sets the marker, resuming the read pointer to a resume-consistent
+ * position within the loaded slice. Does NOT zero unreadCount (read-state PR
+ * B, final whole-branch-review FIX 2) — activating an entity is not the same
+ * event as reading it; the canonical count is derived from the archive and
+ * converges to 0 only via genuine live-edge convergence (Task 11). See the
+ * comment on the return statement for the full rationale.
  *
  * The marker is placed at the first incoming message after the read pointer's
  * position. Whether a delayed message qualifies depends on `treatDelayedAsNew`,
@@ -192,6 +277,7 @@ export function onMessageReceived(
 export function onActivate(
   state: EntityNotificationState,
   messages: NotificationMessage[],
+  kind: 'chat' | 'room',
   options?: { treatDelayedAsNew?: boolean }
 ): EntityNotificationState {
   const { treatDelayedAsNew = false } = options ?? {}
@@ -302,14 +388,31 @@ export function onActivate(
   const pointerMessage = updatedSeenMessageId
     ? messages.find((m) => m.id === updatedSeenMessageId)
     : undefined
-  const updatedPointer = pointerMessage ? makeReadPointer(pointerMessage) : state.readPointer
+  const updatedPointer = pointerMessage ? makeReadPointer(pointerMessage, kind) : state.readPointer
 
-  // Mark as read: clear the counts. The read position is the pointer above and
-  // nothing else — there is no separate "when I last activated" timestamp to
-  // stamp with the newest loaded message, which is what used to let the two
-  // fields disagree about where the user had actually read to.
+  // The read position is the pointer above and nothing else — there is no
+  // separate "when I last activated" timestamp to stamp with the newest loaded
+  // message, which is what used to let the two fields disagree about where the
+  // user had actually read to.
+  //
+  // unreadCount is DELIBERATELY left unchanged (read-state PR B, final
+  // whole-branch-review FIX 2). Activation used to force it to 0 unconditionally,
+  // as if merely opening an entity were equivalent to reading it. It is not: the
+  // one canonical count is derived exclusively from the archive
+  // (recomputeUnreadForConversation / recomputeUnreadForRoom) and converges to 0
+  // only through Task 11's live-edge convergence — an incoming message's pointer
+  // advance in `onMessageReceived`, gated on a real, current-generation
+  // viewport-at-live-edge signal. Forcing 0 here raced ahead of that: it could
+  // zero the badge while snapping the pointer only to just-before-the-divider
+  // (see the resume-preserving placement above), leaving a "New messages"
+  // divider marking genuinely unread messages sitting right next to a count of
+  // 0 — and, since Task 12 removed the resident-derived counts that used to
+  // paper over the mismatch, no surface anywhere showed the real number.
+  // mentionsCount stays zeroed here: PR B scoped the archive derivation to
+  // unreadCount only (mentions are out of scope — see Task 4R), and clearing
+  // the @-mention badge on open is pre-existing, unrelated behavior.
   return {
-    unreadCount: 0,
+    unreadCount: state.unreadCount,
     mentionsCount: 0,
     readPointer: updatedPointer,
     firstNewMessageId,
@@ -354,6 +457,7 @@ export function onDeactivate(
  */
 export function onMarkAsRead(
   state: EntityNotificationState,
+  kind: 'chat' | 'room',
   advanceSeenTo?: PointerSource
 ): EntityNotificationState {
   // Skip update if nothing to change (prevents unnecessary state updates).
@@ -370,7 +474,7 @@ export function onMarkAsRead(
     mentionsCount: 0,
     // No extra forward-only guard: the caller owns the "the user is caught up
     // to this message" call, and the pointer moves whole or not at all.
-    readPointer: advanceSeenTo ? makeReadPointer(advanceSeenTo) : state.readPointer,
+    readPointer: advanceSeenTo ? makeReadPointer(advanceSeenTo, kind) : state.readPointer,
   }
 }
 
@@ -439,6 +543,7 @@ export function onMessageSeen(
   state: EntityNotificationState,
   messageId: string,
   messages: Array<PointerSource>,
+  kind: 'chat' | 'room',
   options?: { atLiveEdge?: boolean }
 ): EntityNotificationState {
   const newIdx = messages.findIndex((m) => m.id === messageId)
@@ -447,7 +552,7 @@ export function onMessageSeen(
   if (newIdx === -1) return state
   const advanced = (): EntityNotificationState => ({
     ...state,
-    readPointer: makeReadPointer(messages[newIdx]),
+    readPointer: makeReadPointer(messages[newIdx], kind),
   })
 
   // No read position yet: any resolvable message is an advancement.
@@ -532,6 +637,7 @@ export interface RecomputeCountsOptions {
 export function recomputeCountsFromPointer(
   state: EntityNotificationState,
   messages: NotificationMessage[],
+  kind: 'chat' | 'room',
   options?: RecomputeCountsOptions
 ): EntityNotificationState {
   const {
@@ -540,6 +646,7 @@ export function recomputeCountsFromPointer(
     hasUnmigratedLegacyReadState = false,
   } = options ?? {}
   if (messages.length === 0) return state
+  if (pointerlessDefers(state.readPointer, state.unreadCount)) return state
 
   if (!state.readPointer) {
     // An unresolved remote marker IS read state — defer to the fold that will
@@ -552,7 +659,7 @@ export function recomputeCountsFromPointer(
       ...state,
       unreadCount: 0,
       mentionsCount: 0,
-      readPointer: makeReadPointer(newest),
+      readPointer: makeReadPointer(newest, kind),
     }
   }
 
@@ -575,7 +682,7 @@ export function recomputeCountsFromPointer(
   let newReadPointer = state.readPointer
   for (let i = messages.length - 1; i >= startIdx; i--) {
     if (messages[i].isOutgoing) {
-      newReadPointer = makeReadPointer(messages[i])
+      newReadPointer = makeReadPointer(messages[i], kind)
       startIdx = i + 1
       break
     }

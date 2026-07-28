@@ -7,9 +7,16 @@ import {
   flush as flushThrottledStorage,
   _resetForTesting as _resetThrottledStorageForTesting,
 } from './shared/throttledStorage'
-import { _resetStorageScopeForTesting, setStorageScopeJid } from '../utils/storageScope'
+import { _resetStorageScopeForTesting, setStorageScopeJid, getStorageScopeJid } from '../utils/storageScope'
 import { setResidentWindowSize } from './shared/residentWindow'
 import { ignoreStore } from './ignoreStore'
+import { _clearAllTransientForTesting, transientCounts } from './shared/transientUnread'
+import {
+  reportViewport,
+  currentViewportGeneration,
+  _clearAllViewportEvidenceForTesting,
+  type EvidenceKey,
+} from './shared/viewportEvidence'
 
 // Mock localStorage
 const localStorageMock = (() => {
@@ -54,6 +61,21 @@ vi.mock('../utils/messageCache', async (importOriginal) => {
 // Import the mocked module for assertions
 import * as messageCache from '../utils/messageCache'
 
+/**
+ * Task 11: simulate the view reporting "genuinely at the live edge" for the
+ * CURRENT activation generation — mirrors what `RoomView`'s `reportLiveEdge`
+ * callback does in the real app after `setActiveRoom` runs. Requires the REAL
+ * `setActiveRoom` to have run first (it is the sole caller of
+ * `beginViewportGeneration`) — a raw `roomStore.setState({ activeRoomJid })`
+ * bypass never begins a generation, so a report against it is (correctly)
+ * rejected as stale/unknown.
+ */
+function reportAtLiveEdge(roomJid: string): void {
+  const key: EvidenceKey = { kind: 'room', entityId: roomJid, accountScope: getStorageScopeJid() ?? '' }
+  reportViewport(key, currentViewportGeneration(key), 'at-edge')
+}
+
+
 describe('roomStore', () => {
   beforeEach(() => {
     _resetStorageScopeForTesting()
@@ -83,6 +105,13 @@ describe('roomStore', () => {
     vi.mocked(messageCache.saveRoomMessages).mockResolvedValue(true)
     // A failed save poisons the per-room chain by design — drop it between tests.
     _resetRoomArchiveSavesForTesting()
+    // The transient overlay is a module-level Map outside any store — several
+    // fixtures below reuse the same room jid + message id across `it()`
+    // blocks, which would otherwise resolve to an already-noted entry.
+    _clearAllTransientForTesting()
+    // Task 11: viewport evidence is ALSO a module-level Map outside any store —
+    // same leakage risk across `it()` blocks reusing the same room jid.
+    _clearAllViewportEvidenceForTesting()
   })
 
   describe('message eviction on deactivation (memory windowing)', () => {
@@ -1032,14 +1061,30 @@ describe('roomStore', () => {
       expect(roomStore.getState().rooms.get('test@conference.example.com')?.unreadCount).toBe(1)
     })
 
-    it('should not increment unread count for active room', () => {
+    it('should not increment unread count for active room AND at the live edge', () => {
       roomStore.getState().addRoom(createRoom('test@conference.example.com'))
-      roomStore.setState({ activeRoomJid: 'test@conference.example.com' })
+      // Task 11: use the REAL setActiveRoom (not a raw activeRoomJid setState) so it
+      // actually begins a viewport-evidence generation, then report the live edge for it.
+      roomStore.getState().setActiveRoom('test@conference.example.com')
+      reportAtLiveEdge('test@conference.example.com')
 
       const message = createMessage('msg1', 'test@conference.example.com', 'alice', 'Hello!')
       roomStore.getState().addMessage('test@conference.example.com', message)
 
       expect(roomStore.getState().rooms.get('test@conference.example.com')?.unreadCount).toBe(0)
+    })
+
+    it('increments unread count when room is active but the viewport has never reported (Task 11 regression control)', () => {
+      // The negative control this task exists for: active is NOT enough on its own
+      // anymore. Without a live-edge report, an active room must behave like any
+      // other unseen arrival.
+      roomStore.getState().addRoom(createRoom('test@conference.example.com'))
+      roomStore.getState().setActiveRoom('test@conference.example.com')
+
+      const message = createMessage('msg1', 'test@conference.example.com', 'alice', 'Hello!')
+      roomStore.getState().addMessage('test@conference.example.com', message)
+
+      expect(roomStore.getState().rooms.get('test@conference.example.com')?.unreadCount).toBe(1)
     })
 
     it('should not increment unread count for outgoing messages', () => {
@@ -1066,6 +1111,34 @@ describe('roomStore', () => {
       // Sending a message clears unread state - user is engaging with the room
       expect(room?.unreadCount).toBe(0)
       expect(room?.mentionsCount).toBe(0)
+    })
+
+    // Regression test for room-pointer-count-divergence: an automated review
+    // pass fixed a stale-count bug by making unreadCount conditional on
+    // whether the pointer moved, which (for THIS exact scenario — outgoing
+    // message, pointer advances, count is genuinely 0) threw away the fresh
+    // `0` and kept the seeded `5`. The real fix commits `updated.readPointer`
+    // in the same write as `unreadCount`, so the two can never disagree about
+    // which position the count is relative to. Seeds a DISTINGUISHING nonzero
+    // count (7, not 0) and asserts BOTH sides of the atomic write — a test
+    // that only checked the count could pass even with the pointer commit
+    // reverted (the conditional-count bug's own regression test proves that);
+    // a test that only checked the pointer would miss the count regression
+    // entirely.
+    it('advances the read pointer atomically with clearing unread count on an outgoing message', () => {
+      roomStore.getState().addRoom(createRoom('test@conference.example.com', {
+        unreadCount: 7,
+      }))
+
+      const message = createMessage('msg-outgoing', 'test@conference.example.com', 'me', 'My reply', true)
+      roomStore.getState().addMessage('test@conference.example.com', message)
+
+      const room = roomStore.getState().rooms.get('test@conference.example.com')
+      const meta = roomStore.getState().roomMeta.get('test@conference.example.com')
+      expect(room?.unreadCount).toBe(0)
+      expect(room?.readPointer?.messageId).toBe('msg-outgoing')
+      expect(meta?.unreadCount).toBe(0)
+      expect(meta?.readPointer?.messageId).toBe('msg-outgoing')
     })
 
     it('should not increment unread count for delayed (historical) messages', () => {
@@ -1298,10 +1371,16 @@ describe('roomStore', () => {
     // new message'. That behaviour is deliberately gone with #1081: this path
     // advanced `lastReadAt` (the derivation FLOOR) while leaving the position
     // the room actually held put, so the floor ran ahead of the read position
-    // and later derivations under-counted. roomStore.addMessage has never
-    // advanced the room's read position — unlike its chatStore twin — and that
-    // parity gap is now simply visible rather than half-papered-over.
-    it('should NOT move the read pointer when an active room gets a new message', () => {
+    // and later derivations under-counted.
+    //
+    // roomStore.addMessage now DOES advance the room's read position — but
+    // only when `onMessageReceived` decides the user genuinely saw the
+    // message (outgoing, or active+focused+at-the-live-edge), matching its
+    // chatStore twin (see the outgoing-message tests above for the positive
+    // case). This test's room is active but never reports live-edge viewport
+    // evidence (no `reportAtLiveEdge` call), so it stays in the "user doesn't
+    // see the message" branch and the pointer is correctly left untouched.
+    it('should NOT move the read pointer when an active room gets a new message without live-edge evidence', () => {
       const existing = { messageId: 'older', timestamp: new Date('2025-01-15T08:00:00Z') }
       roomStore.getState().addRoom(createRoom('test@conference.example.com', {
         readPointer: existing,
@@ -1371,6 +1450,150 @@ describe('roomStore', () => {
 
       const room = roomStore.getState().rooms.get('test@conference.example.com')
       expect(room?.unreadCount).toBe(1)
+    })
+
+    describe('Task 9 — transient overlay wiring', () => {
+      const ROOM = 'overlay@conference.example.com'
+
+      it('registers a renderable noLocalStore message in the transient overlay, not just the badge', () => {
+        roomStore.getState().addRoom(createRoom(ROOM))
+        const message = { ...createMessage('m1', ROOM, 'alice', 'Ephemeral'), noLocalStore: true, originId: 'orig-1' }
+
+        roomStore.getState().addMessage(ROOM, message)
+
+        expect(roomStore.getState().rooms.get(ROOM)?.unreadCount).toBe(1)
+        // Proves the entry actually landed in the overlay — not merely a bare
+        // `+1` somewhere else — by querying the overlay's own primitive
+        // directly, the same one the archive-derived recompute reads.
+        expect(
+          transientCounts({ accountScope: getStorageScopeJid() ?? '', kind: 'room', entityId: ROOM }, undefined).unread
+        ).toBe(1)
+      })
+
+      it('does not increment unreadCount again when the same logical message is re-delivered under a higher identity tier', () => {
+        roomStore.getState().addRoom(createRoom(ROOM))
+        // The local echo: only an origin-id (client-assigned, XEP-0359).
+        const local = { ...createMessage('m1', ROOM, 'alice', 'Ephemeral'), noLocalStore: true, originId: 'orig-1' }
+        roomStore.getState().addMessage(ROOM, local)
+        expect(roomStore.getState().rooms.get(ROOM)?.unreadCount).toBe(1)
+
+        // Simulate the resident window having evicted the local echo (memory
+        // windowing / a backgrounded room) — the overlay itself is NEVER
+        // cleared on deactivation, so it is the only thing standing between
+        // this redelivery and a double count. Without this eviction, the
+        // TIMELINE's own dedupe (appendLive, keyed off the SAME tiered
+        // identity) would already catch the duplicate before the overlay's
+        // `added` gate is ever consulted — making the control hollow.
+        roomStore.setState((state) => {
+          const rooms = new Map(state.rooms)
+          const existing = rooms.get(ROOM)
+          if (existing) rooms.set(ROOM, { ...existing, messages: [] })
+          return { rooms }
+        })
+
+        // The MUC's real-time reflection of the SAME message: shares the
+        // origin-id alias with the local echo, but now ALSO carries a
+        // server-assigned stanza-id — a HIGHER identity tier. `noteTransient`
+        // resolves this to the SAME logical entry (`added: false`), so the
+        // badge must not double-count it.
+        const reflected = { ...local, stanzaId: 'stanza-1' }
+        roomStore.getState().addMessage(ROOM, reflected)
+
+        expect(roomStore.getState().rooms.get(ROOM)?.unreadCount).toBe(1)
+      })
+
+      it('schedules an archive recount when noteTransient reports a coalesce (requiresRecount)', () => {
+        roomStore.getState().addRoom(createRoom(ROOM))
+        const from = `${ROOM}/alice`
+        // Two DISTINCT noLocalStore entries, each known under only ONE tier.
+        const first = { ...createMessage('a', ROOM, 'alice', 'Ephemeral'), noLocalStore: true, originId: 'O' }
+        const second = { ...createMessage('b', ROOM, 'alice', 'Ephemeral'), noLocalStore: true, stanzaId: 'S' }
+        roomStore.getState().addMessage(ROOM, first)
+        roomStore.getState().addMessage(ROOM, second)
+        expect(
+          transientCounts({ accountScope: getStorageScopeJid() ?? '', kind: 'room', entityId: ROOM }, undefined).unread
+        ).toBe(2)
+
+        const recomputeSpy = vi.spyOn(roomStore.getState(), 'recomputeUnreadForRoom').mockResolvedValue(undefined)
+
+        // A THIRD delivery carrying BOTH the origin-id and the stanza-id
+        // bridges the two previously-separate entries into one — a coalesce
+        // (`added: false, requiresRecount: true`). The live path cannot
+        // safely apply a synchronous delta for this case (see noteTransient's
+        // doc) — only the archive-derived recompute can fold it back in.
+        const bridge = { ...createMessage('c', ROOM, 'alice', 'Ephemeral'), noLocalStore: true, originId: 'O', stanzaId: 'S', from }
+        roomStore.getState().addMessage(ROOM, bridge)
+
+        expect(recomputeSpy).toHaveBeenCalledWith(ROOM)
+        // The two entries are now one — the overlay's own count reflects it
+        // even before any recompute resolves.
+        expect(
+          transientCounts({ accountScope: getStorageScopeJid() ?? '', kind: 'room', entityId: ROOM }, undefined).unread
+        ).toBe(1)
+
+        recomputeSpy.mockRestore()
+      })
+
+      it('prunes the overlay entry once markReadToNewest passes it (memory bound, not correctness)', () => {
+        roomStore.getState().addRoom(createRoom(ROOM))
+        const message = { ...createMessage('m1', ROOM, 'alice', 'Ephemeral'), noLocalStore: true }
+        roomStore.getState().addMessage(ROOM, message)
+        const key = { accountScope: getStorageScopeJid() ?? '', kind: 'room' as const, entityId: ROOM }
+        expect(transientCounts(key, undefined).unread).toBe(1)
+
+        roomStore.getState().markReadToNewest(ROOM)
+
+        expect(transientCounts(key, undefined).unread).toBe(0)
+      })
+
+      it('removes the overlay entry when the message is retracted, and schedules a recount', () => {
+        roomStore.getState().addRoom(createRoom(ROOM))
+        const message = { ...createMessage('m1', ROOM, 'alice', 'Ephemeral'), noLocalStore: true }
+        roomStore.getState().addMessage(ROOM, message)
+        const key = { accountScope: getStorageScopeJid() ?? '', kind: 'room' as const, entityId: ROOM }
+        expect(transientCounts(key, undefined).unread).toBe(1)
+
+        const recomputeSpy = vi.spyOn(roomStore.getState(), 'recomputeUnreadForRoom').mockResolvedValue(undefined)
+
+        roomStore.getState().updateMessage(ROOM, 'm1', { isRetracted: true, retractedAt: new Date() })
+
+        expect(transientCounts(key, undefined).unread).toBe(0)
+        expect(recomputeSpy).toHaveBeenCalledWith(ROOM)
+
+        recomputeSpy.mockRestore()
+      })
+
+      it('clears the outgoing account transient overlay on switchAccount, and the current account on reset', () => {
+        // Prime lastRoomTransientScope: the very first switchAccount call in a
+        // session has nothing prior to clear (see its doc) — this establishes
+        // 'alice' as the tracked scope before the transition under test.
+        setStorageScopeJid('alice@example.com')
+        roomStore.getState().switchAccount('alice@example.com')
+        roomStore.getState().addRoom(createRoom(ROOM))
+        const aliceMsg = { ...createMessage('m1', ROOM, 'bob', 'Ephemeral'), noLocalStore: true }
+        roomStore.getState().addMessage(ROOM, aliceMsg)
+        const aliceKey = { accountScope: 'alice@example.com', kind: 'room' as const, entityId: ROOM }
+        expect(transientCounts(aliceKey, undefined).unread).toBe(1)
+
+        setStorageScopeJid('carol@example.com')
+        roomStore.getState().switchAccount('carol@example.com')
+
+        expect(transientCounts(aliceKey, undefined).unread).toBe(0)
+
+        // reset() (logout): nothing flips the scope beforehand, so it tears
+        // down whatever getStorageScopeJid() currently names (carol).
+        roomStore.getState().addRoom(createRoom(ROOM))
+        const carolMsg = { ...createMessage('m2', ROOM, 'dave', 'Ephemeral'), noLocalStore: true }
+        roomStore.getState().addMessage(ROOM, carolMsg)
+        const carolKey = { accountScope: 'carol@example.com', kind: 'room' as const, entityId: ROOM }
+        expect(transientCounts(carolKey, undefined).unread).toBe(1)
+
+        roomStore.getState().reset()
+
+        expect(transientCounts(carolKey, undefined).unread).toBe(0)
+
+        _resetStorageScopeForTesting()
+      })
     })
 
     describe('lastMessage preview — delayed arrivals must not regress the sidebar', () => {
@@ -1563,7 +1786,7 @@ describe('roomStore', () => {
       roomStore.getState().markAsRead('test@conference.example.com')
 
       const room = roomStore.getState().rooms.get('test@conference.example.com')
-      expect(room?.readPointer).toEqual({ messageId: 'msg1', timestamp: msgTimestamp })
+      expect(room?.readPointer).toMatchObject({ messageId: 'msg1', timestamp: msgTimestamp })
     })
 
     // Replaces 'should set lastReadAt to current time when no messages exist'
@@ -1602,7 +1825,7 @@ describe('roomStore', () => {
       roomStore.getState().markAsRead('test@conference.example.com')
 
       const room = roomStore.getState().rooms.get('test@conference.example.com')
-      expect(room?.readPointer).toEqual({ messageId: 'msg1', timestamp: msgTimestamp })
+      expect(room?.readPointer).toMatchObject({ messageId: 'msg1', timestamp: msgTimestamp })
     })
 
     it('should not trigger state update when called twice at the same read position (regression test for infinite loop)', () => {
@@ -1623,7 +1846,7 @@ describe('roomStore', () => {
       const roomAfterFirst = roomStore.getState().rooms.get('test@conference.example.com')
       expect(roomAfterFirst?.unreadCount).toBe(0)
       expect(roomAfterFirst?.mentionsCount).toBe(0)
-      expect(roomAfterFirst?.readPointer).toEqual({ messageId: 'msg1', timestamp: msgTimestamp })
+      expect(roomAfterFirst?.readPointer).toMatchObject({ messageId: 'msg1', timestamp: msgTimestamp })
 
       // Capture rooms Map reference after first markAsRead
       const roomsMapAfterFirst = roomStore.getState().rooms
@@ -1775,9 +1998,12 @@ describe('roomStore', () => {
       expect(roomStore.getState().rooms.get('test@conference.example.com')?.mentionsCount).toBe(1)
     })
 
-    it('should not increment mentions count for active room', () => {
+    it('should not increment mentions count for active room AND at the live edge', () => {
       roomStore.getState().addRoom(createRoom('test@conference.example.com'))
-      roomStore.setState({ activeRoomJid: 'test@conference.example.com' })
+      // Task 11: use the REAL setActiveRoom so a viewport-evidence generation
+      // actually begins, then report the live edge for it.
+      roomStore.getState().setActiveRoom('test@conference.example.com')
+      reportAtLiveEdge('test@conference.example.com')
 
       const message = createMessage('msg1', 'test@conference.example.com', 'alice', 'Hey @testuser!')
       roomStore.getState().addMessage('test@conference.example.com', message, { incrementMentions: true })
@@ -1976,12 +2202,19 @@ describe('roomStore', () => {
       expect(roomStore.getState().activeRoomJid).toBe('test@conference.example.com')
     })
 
-    it('should mark room as read when becoming active', () => {
+    // Read-state PR B, final whole-branch-review FIX 2: this used to protect
+    // "activating a room force-zeroes unreadCount". That behaviour is removed —
+    // the canonical count is derived exclusively from the archive
+    // (recomputeUnreadForRoom) and converges to 0 only through Task 11's
+    // live-edge convergence, never as a side effect of merely opening the room.
+    // This test now protects the opposite: setActiveRoom must leave the count
+    // untouched.
+    it('does not zero unreadCount when becoming active (count is archive-derived)', () => {
       roomStore.getState().addRoom(createRoom('test@conference.example.com', { unreadCount: 3 }))
 
       roomStore.getState().setActiveRoom('test@conference.example.com')
 
-      expect(roomStore.getState().rooms.get('test@conference.example.com')?.unreadCount).toBe(0)
+      expect(roomStore.getState().rooms.get('test@conference.example.com')?.unreadCount).toBe(3)
     })
 
     it('should allow clearing active room with null', () => {
@@ -3702,8 +3935,9 @@ describe('roomStore', () => {
       roomStore.getState().addRoom(createRoom('room1@conference.example.com'))
       roomStore.getState().addRoom(createRoom('room2@conference.example.com'))
 
-      // View Room 1
+      // View Room 1, genuinely at the live edge (Task 11).
       roomStore.getState().setActiveRoom('room1@conference.example.com')
+      reportAtLiveEdge('room1@conference.example.com')
 
       // Messages to inactive room should increment unread
       roomStore.getState().addMessage(
@@ -4188,14 +4422,27 @@ describe('roomStore', () => {
       roomStore.setState({ activeRoomJid: 'other@conference.example.com' })
     })
 
-    it('forward merge into a non-active room recomputes unread and mention counts from the pointer', () => {
+    // PR B (Task 8): a forward merge into a non-active room no longer writes a
+    // page-scoped count synchronously — it schedules recomputeUnreadForRoom
+    // (fire-and-forget), which derives the badge from the durable archive
+    // instead (see roomStore.archiveUnread.test.ts for the exact-outcome
+    // path). With no mamQueryStates/roomCoverage seeded here, that derivation
+    // defers, so the count stays at its seeded stale value (5) rather than
+    // snapping to this page's own tally (2 unread / 1 mention) — a nonzero,
+    // distinguishing seed (not the tautological 0 -> 0) proves the
+    // page-scoped write is really gone, not merely absent by coincidence.
+    it('forward merge into a non-active room defers the count until coverage is proven (no page-scoped write)', async () => {
       roomStore.setState((state) => {
         const meta = new Map(state.roomMeta)
         meta.set(roomJid, {
           ...meta.get(roomJid)!,
+          unreadCount: 5,
+          mentionsCount: 2,
           readPointer: { messageId: 'm1', timestamp: new Date('2024-01-15T09:30:00Z') },
         })
-        return { roomMeta: meta }
+        const rooms = new Map(state.rooms)
+        rooms.set(roomJid, { ...rooms.get(roomJid)!, unreadCount: 5, mentionsCount: 2 })
+        return { roomMeta: meta, rooms }
       })
 
       const mamMessages: RoomMessage[] = [
@@ -4237,13 +4484,16 @@ describe('roomStore', () => {
 
       roomStore.getState().mergeRoomMAMMessages(roomJid, mamMessages, {}, true, 'forward')
 
+      // Let the fire-and-forget archive recount run to completion.
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
       const meta = roomStore.getState().roomMeta.get(roomJid)
-      expect(meta?.unreadCount).toBe(2)
-      expect(meta?.mentionsCount).toBe(1)
+      expect(meta?.unreadCount).toBe(5)
+      expect(meta?.mentionsCount).toBe(2)
       // Combined map mirrors meta.
       const room = roomStore.getState().rooms.get(roomJid)
-      expect(room?.unreadCount).toBe(2)
-      expect(room?.mentionsCount).toBe(1)
+      expect(room?.unreadCount).toBe(5)
+      expect(room?.mentionsCount).toBe(2)
     })
 
     it('forward merge into a room with NO read state snaps the pointer (fresh-join guard)', () => {
@@ -5888,6 +6138,13 @@ describe('setActiveRoom new-message marker — delayed history unified with chat
     vi.mocked(messageCache.saveRoomMessages).mockResolvedValue(true)
     // A failed save poisons the per-room chain by design — drop it between tests.
     _resetRoomArchiveSavesForTesting()
+    // The transient overlay is a module-level Map outside any store — several
+    // fixtures below reuse the same room jid + message id across `it()`
+    // blocks, which would otherwise resolve to an already-noted entry.
+    _clearAllTransientForTesting()
+    // Task 11: viewport evidence is ALSO a module-level Map outside any store —
+    // same leakage risk across `it()` blocks reusing the same room jid.
+    _clearAllViewportEvidenceForTesting()
   })
 
   function delayedMsg(id: string, nick: string, ts: string): RoomMessage {

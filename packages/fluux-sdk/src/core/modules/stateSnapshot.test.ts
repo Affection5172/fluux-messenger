@@ -8,6 +8,7 @@ import type { Contact, Room } from '../types'
 import { rosterStore } from '../../stores/rosterStore'
 import { roomStore } from '../../stores/roomStore'
 import { connectionStore } from '../../stores/connectionStore'
+import { makeReadPointer } from '../../stores/shared/readPointer'
 import { StateSnapshot } from './stateSnapshot'
 
 interface MemoryStore {
@@ -174,6 +175,30 @@ describe('StateSnapshot', () => {
         .toEqual({ messageId: 'msg-42', timestamp: readAt })
     })
 
+    // PR B (Task 8, cold-start rehydrate trigger): a room restored here may
+    // carry a stale `unreadCount` (the value this device last wrote, before
+    // whatever arrived while the app was closed). `hydrate()` schedules an
+    // archive-derived recompute for every restored room, mirroring
+    // chatStore's own cold-start recount for conversations (see
+    // roomStore.archiveUnread.test.ts for recomputeUnreadForRoom's full
+    // derivation matrix). Fire-and-forget — yields a task first — so this
+    // awaits a tick before asserting the spy was called.
+    it('cold-start rehydrate schedules a recount for every restored room', async () => {
+      adapterData.store.set('user@example.com', {
+        rooms: [makeRoom('room@conf.example.com', { unreadCount: 3 })],
+      })
+      const original = roomStore.getState().recomputeUnreadForRoom
+      const spy = vi.fn(original)
+      roomStore.setState({ recomputeUnreadForRoom: spy })
+
+      await snapshot.hydrate('user@example.com')
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      expect(spy).toHaveBeenCalledWith('room@conf.example.com')
+      // Restore the un-wrapped action so later tests aren't left with a spy.
+      roomStore.setState({ recomputeUnreadForRoom: original })
+    })
+
     // The write half. Without it, hydrate could pass forever against a snapshot
     // nothing ever writes a pointer into.
     it('persists the room read pointer so it can be hydrated back', async () => {
@@ -188,6 +213,35 @@ describe('StateSnapshot', () => {
         readPointer?: { messageId: string; timestamp: number }
       }>
       expect(persisted?.readPointer).toEqual({ messageId: 'msg-7', timestamp: readAt.getTime() })
+    })
+
+    // Task 2 (#1102): the structured archiveOrderKey rides through this
+    // surface too — round-tripped on both halves (write via flush, read back
+    // via hydrate), not assumed from the plain-field case above.
+    it('round-trips the archiveOrderKey through flush and hydrate', async () => {
+      const readAt = new Date('2026-04-21T09:20:00Z')
+      const pointer = makeReadPointer({ id: 'msg-8', from: 'room@conf.example.com/alice', timestamp: readAt }, 'room')
+      roomStore.getState().addRoom(makeRoom('room@conf.example.com', { readPointer: pointer }))
+
+      await snapshot.flush()
+
+      const [persisted] = adapterData.store.get('user@example.com')!.rooms as Array<{
+        readPointer?: { messageId: string; timestamp: number; archiveOrderKey?: unknown }
+      }>
+      expect(persisted?.readPointer?.archiveOrderKey).toEqual({
+        kind: 'room',
+        from: 'room@conf.example.com/alice',
+        id: 'msg-8',
+      })
+
+      // Read back: a fresh hydrate into an empty room store must recover it.
+      roomStore.getState().removeRoom('room@conf.example.com')
+      await snapshot.hydrate('user@example.com')
+      expect(roomStore.getState().rooms.get('room@conf.example.com')?.readPointer?.archiveOrderKey).toEqual({
+        kind: 'room',
+        from: 'room@conf.example.com/alice',
+        id: 'msg-8',
+      })
     })
 
     it('restores server info, own nickname and avatar hash', async () => {

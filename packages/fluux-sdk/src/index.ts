@@ -196,7 +196,15 @@ export type { EntityNotificationState, NotificationMessage, EntityContext, Badge
 
 // Read pointer (canonical read position; supersedes lastSeenMessageId + lastReadAt, issue #1081)
 export type { ReadPointer } from './stores/shared/readPointer'
-export { makeReadPointer, isAhead, advance, readFloor } from './stores/shared/readPointer'
+export { makeReadPointer, isAhead, advance } from './stores/shared/readPointer'
+
+// Viewport evidence (read-state PR B, Task 11): SDK-owned, generation-scoped
+// "is the viewport genuinely at the live edge" state. `beginViewportGeneration`
+// is deliberately NOT exported here — the SDK's activation path
+// (setActiveConversation/setActiveRoom) is its sole caller; the app only ever
+// reads the current generation and reports against it.
+export type { ViewportEvidence, EvidenceKey as ViewportEvidenceKey } from './stores/shared/viewportEvidence'
+export { currentViewportGeneration, reportViewport } from './stores/shared/viewportEvidence'
 
 // Store bindings (wire SDK events to Zustand stores)
 export { createStoreBindings } from './bindings'

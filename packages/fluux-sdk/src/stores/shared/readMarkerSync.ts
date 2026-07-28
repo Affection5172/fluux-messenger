@@ -57,6 +57,7 @@ export function resolveRemoteDisplayed<T extends NotificationMessage & { stanzaI
   messages: T[],
   currentFirstNewMessageId: string | undefined,
   stanzaId: string,
+  kind: 'chat' | 'room',
   options: { isActive: boolean; treatDelayedAsNew?: boolean }
 ): RemoteDisplayedResolution {
   const match = messages.find((m) => m.stanzaId === stanzaId)
@@ -107,7 +108,8 @@ export function resolveRemoteDisplayed<T extends NotificationMessage & { stanzaI
       firstNewMessageId: currentFirstNewMessageId,
     },
     match.id,
-    messages
+    messages,
+    kind
   )
 
   // An advance always lands on `match` — `onMessageSeen` only ever moves to the
@@ -136,6 +138,7 @@ export function resolveRemoteDisplayed<T extends NotificationMessage & { stanzaI
       firstNewMessageId: undefined,
     },
     messages,
+    kind,
     options.treatDelayedAsNew ? { treatDelayedAsNew: true } : undefined
   ).firstNewMessageId
 

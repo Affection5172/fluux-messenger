@@ -10,8 +10,14 @@
 import { openDB, type IDBPDatabase, type DBSchema } from 'idb'
 import type { Message, RoomMessage } from '../core/types'
 import { getStorageScopeJid } from './storageScope'
-import { isRenderableStoredMessage } from './messageRenderability'
 import { roomCanonicalKey, roomIdentityKeys, roomStanzaKey, roomOriginKey } from './roomMessageIdentity'
+import {
+  makeArchiveOrderKey,
+  compareOrder,
+  isRenderableStoredMessage,
+  type ArchiveOrderKey,
+  type OrderPosition,
+} from '../stores/shared/readState'
 
 const DB_NAME = 'fluux-message-cache'
 // v3: add a SPARSE index on `encryptedPayload` so deferred decryption can list
@@ -457,7 +463,8 @@ function contentOwner(a: StoredRoomMessage, b: StoredRoomMessage): StoredRoomMes
  * Merge two stored rows that are the same logical room message into one.
  * COMMUTATIVE and ASSOCIATIVE. The correlated content block comes from
  * {@link contentOwner} (total order); every other field uses a symmetric operator,
- * so no edit, poll closure, retraction, reaction, moderation, or alias is lost.
+ * so no edit, poll closure, retraction, reaction, moderation, mention, or alias
+ * is lost.
  */
 export function mergeRoomRows(a: StoredRoomMessage, b: StoredRoomMessage): StoredRoomMessage {
   const owner = contentOwner(a, b)
@@ -465,6 +472,13 @@ export function mergeRoomRows(a: StoredRoomMessage, b: StoredRoomMessage): Store
   const timestamp = aSid !== bSid ? (aSid ? a.timestamp : b.timestamp) : Math.min(a.timestamp, b.timestamp)
   const retracted = !!(a.isRetracted || b.isRetracted)
   const moderated = !!(a.isModerated || b.isModerated)
+  // isMention is set only on the live stanza path and never recomputed for a MAM
+  // copy of the same message (see countRoomUnreadInArchive's doc), so it must be
+  // treated as MONOTONIC evidence here: an absent/false flag on one copy must
+  // never erase a `true` established by the other. OR it independently of
+  // contentOwner — taking it from `owner` alone would silently drop a live-set
+  // `true` whenever the MAM copy (no flag) wins content ownership.
+  const mentioned = !!(a.isMention || b.isMention)
   // Poll closure: symmetric even when both closed with different records.
   const pollClosed = a.pollClosed && b.pollClosed
     ? (stableStringify(a.pollClosed) <= stableStringify(b.pollClosed) ? a.pollClosed : b.pollClosed)
@@ -482,6 +496,7 @@ export function mergeRoomRows(a: StoredRoomMessage, b: StoredRoomMessage): Store
     ...(retracted ? { isRetracted: true, retractedAt: minNum(a.retractedAt, b.retractedAt) } : {}),
     ...(moderated ? { isModerated: true, moderatedBy: minStr(a.moderatedBy, b.moderatedBy), moderationReason: minStr(a.moderationReason, b.moderationReason) } : {}),
     ...(pollClosed ? { pollClosed, pollClosedAt: minNum(a.pollClosedAt, b.pollClosedAt) } : {}),
+    ...(mentioned ? { isMention: true } : {}),
   }
   merged.cacheKey = roomCanonicalKey(merged)
   merged.identityKeys = unionSorted(merged.identityKeys, roomIdentityKeys(merged))
@@ -818,6 +833,117 @@ export async function getMessageCount(conversationId: string): Promise<number> {
       console.warn('Failed to count messages:', error)
     }
     return 0
+  }
+}
+
+// =============================================================================
+// PR B: archive count primitive (unread only — mentions stay on the live +1 path)
+// =============================================================================
+
+/** Default cap on the reported `unread` count — the badge saturates here. */
+const DEFAULT_UNREAD_CAP = 999
+
+export interface UnreadCountArgs {
+  /** Cursor start: the read pointer's timestamp, or the entity's history watermark. */
+  floor: Date
+  /**
+   * The read pointer's position, for a strict-after-POSITION test rather than a
+   * timestamp-only test — two messages can share a millisecond. When
+   * `archiveOrderKey` is omitted (a pointer migrated from the pre-#1081 legacy
+   * fields), `compareOrder` treats the pointer's key as unresolved, and an
+   * unresolved key sorts BEFORE any resolved one at an equal timestamp — so
+   * every row at the pointer's exact millisecond, including the pointer's own
+   * message, resolves as "after" the pointer and gets counted. That is
+   * at-or-after-TIMESTAMP semantics, not strict-after-timestamp: it over-counts
+   * by up to the same-ms sibling set, which is the safe direction (an
+   * over-count clears the moment the user reads; an under-count would hide a
+   * message permanently). Omitting `pointer` entirely counts everything from
+   * `floor`.
+   */
+  pointer?: { timestamp: Date; archiveOrderKey?: ArchiveOrderKey }
+  /** Cap on the reported `unread` count. Default {@link DEFAULT_UNREAD_CAP}. */
+  unreadCap?: number
+}
+
+/** Result of an archive unread count. */
+export interface ArchiveCount {
+  /** Renderable incoming messages strictly after the pointer, saturating at `unreadCap`. */
+  unread: number
+}
+
+/** The pointer's position as an `OrderPosition`, or `undefined` when there is no pointer. */
+function toPointerPosition(pointer: UnreadCountArgs['pointer']): OrderPosition | undefined {
+  return pointer ? { timestamp: pointer.timestamp.getTime(), archiveOrderKey: pointer.archiveOrderKey } : undefined
+}
+
+/**
+ * Whether an archive row's position sorts strictly after the read pointer. No
+ * pointer means everything from `floor` counts. Uses {@link compareOrder} —
+ * never hand-roll this comparison, it is the one place total order is defined.
+ */
+function isStrictlyAfterPointer(position: OrderPosition, pointerPosition: OrderPosition | undefined): boolean {
+  return pointerPosition ? compareOrder(position, pointerPosition) > 0 : true
+}
+
+/**
+ * Count unread chat messages in the durable archive, independent of what is
+ * resident in memory — the replacement for the incremental `+1` counter and the
+ * bounded-slice recount, neither of which is correct for a backgrounded
+ * conversation with deep history.
+ *
+ * Cursors `conv_timestamp` forward from `floor`, counting renderable incoming
+ * rows strictly after the pointer's POSITION (not just its timestamp — see
+ * {@link isStrictlyAfterPointer}). `unread` saturates at `unreadCap`; once it
+ * reaches the cap there is nothing further this walk can learn, so it ends
+ * there.
+ *
+ * This derives `unread` only. Mentions stay on the existing live `+1` counter
+ * (`isMention` is set only on the live stanza path — see `Chat.ts` — and
+ * never recomputed for archive rows, so an archive scan cannot report a
+ * trustworthy mention count).
+ *
+ * Returns `null` on any IndexedDB error, so callers can distinguish "zero
+ * unread" from "could not determine."
+ */
+export async function countUnreadInArchive(
+  conversationId: string,
+  args: UnreadCountArgs
+): Promise<ArchiveCount | null> {
+  const { floor, pointer, unreadCap = DEFAULT_UNREAD_CAP } = args
+  try {
+    const db = await getDB(getStorageScopeJid())
+    const tx = db.transaction(MESSAGES_STORE, 'readonly')
+    const index = tx.store.index('conv_timestamp')
+    const range = IDBKeyRange.bound([conversationId, floor.getTime()], [conversationId, Number.MAX_SAFE_INTEGER])
+
+    const pointerPosition = toPointerPosition(pointer)
+    let unread = 0
+
+    let cursor = await index.openCursor(range, 'next')
+    while (cursor) {
+      const stored = cursor.value
+      if (stored.conversationId === conversationId) {
+        const message = deserializeMessage(stored)
+        if (!message.isOutgoing && isRenderableStoredMessage(message)) {
+          const position: OrderPosition = {
+            timestamp: stored.timestamp,
+            archiveOrderKey: makeArchiveOrderKey(message, 'chat'),
+          }
+          if (isStrictlyAfterPointer(position, pointerPosition)) {
+            unread++
+            if (unread >= unreadCap) break
+          }
+        }
+      }
+      cursor = await cursor.continue()
+    }
+
+    return { unread }
+  } catch (error) {
+    if (isIndexedDBAvailable()) {
+      console.warn('Failed to count unread in archive:', error)
+    }
+    return null
   }
 }
 
@@ -1167,6 +1293,106 @@ export async function getRoomMessageCount(roomJid: string): Promise<number> {
       console.warn('Failed to count room messages:', error)
     }
     return 0
+  }
+}
+
+/**
+ * Count unread room messages in the durable archive, independent of what is
+ * resident in memory. Room counterpart of {@link countUnreadInArchive} — see it
+ * for the general shape.
+ *
+ * Cursors `room_ts_from_id` — `[roomJid, timestamp, from, id]` — forward from
+ * `floor`. This is that index's first consumer. The upper bound is
+ * `[roomJid, Infinity, '￿', '￿']`; every row in range is visited and
+ * adjudicated independently by {@link compareOrder}, so it is the `Infinity`
+ * in the timestamp slot — not the `'￿'` string sentinels — that makes the
+ * bound safe: any finite timestamp compares less than `Infinity`, so the
+ * trailing `from`/`id` components are never actually reached. Swapping
+ * `Infinity` for `Number.MAX_SAFE_INTEGER` (the convention used in the chat
+ * range above) would make those sentinels suddenly load-bearing, and could
+ * silently drop a row whose `from` sorts above `'￿'`. `unread` saturates at
+ * `unreadCap`; once it reaches the cap there is nothing further this walk can
+ * learn, so it ends there.
+ *
+ * This derives `unread` only, deliberately — an earlier revision of this
+ * primitive also tallied mentions from the archive, but `isMention` is set
+ * only on the live stanza path (`Chat.ts`'s `checkForMention`) and is never
+ * recomputed for MAM rows (`MAM.ts`'s `RoomMessage` construction), so an
+ * archive scan reports `0` for every mention that arrived while offline —
+ * and a "complete scan may lower the count" rule would zero out a correctly
+ * live-counted mention. Mentions stay on the existing live `+1` counter,
+ * cleared by explicit read / mark-read.
+ *
+ * Returns `null` on any IndexedDB error, so callers can distinguish "zero
+ * unread" from "could not determine."
+ */
+export async function countRoomUnreadInArchive(roomJid: string, args: UnreadCountArgs): Promise<ArchiveCount | null> {
+  const { floor, pointer, unreadCap = DEFAULT_UNREAD_CAP } = args
+  try {
+    const db = await getDB(getStorageScopeJid())
+    const tx = db.transaction(ROOM_MESSAGES_STORE, 'readonly')
+    const index = tx.store.index('room_ts_from_id')
+    const range = IDBKeyRange.bound([roomJid, floor.getTime(), '', ''], [roomJid, Infinity, '￿', '￿'])
+
+    const pointerPosition = toPointerPosition(pointer)
+    let unread = 0
+
+    let cursor = await index.openCursor(range, 'next')
+    while (cursor) {
+      const stored = cursor.value
+      if (stored.roomJid === roomJid) {
+        const message = deserializeRoomMessage(stored)
+        if (!message.isOutgoing && isRenderableStoredMessage(message)) {
+          const position: OrderPosition = {
+            timestamp: stored.timestamp,
+            archiveOrderKey: makeArchiveOrderKey(message, 'room'),
+          }
+          if (isStrictlyAfterPointer(position, pointerPosition)) {
+            unread++
+            if (unread >= unreadCap) break
+          }
+        }
+      }
+      cursor = await cursor.continue()
+    }
+
+    return { unread }
+  } catch (error) {
+    if (isIndexedDBAvailable()) {
+      console.warn('Failed to count room unread in archive:', error)
+    }
+    return null
+  }
+}
+
+/**
+ * Resolve an archive id — a MAM `rsm.first`/`rsm.last` value, which is what a
+ * {@link CoverageRecord}'s `bottomId` names — to its position in archive
+ * order. `parseArchiveMessage`/`parseRoomArchiveMessage` (`MAM.ts`) store this
+ * id as the row's `stanzaId` (`stanzaId = parsed.stanzaId || archiveId`), so
+ * the lookup goes through the stanza-id path, never the client-generated
+ * `id`. Rooms reuse their own per-archive id sequence, so a bare `stanzaId`
+ * index lookup could return a DIFFERENT room's row — {@link
+ * getRoomMessageByStanzaId} confines it to `entityId` (room-scoping
+ * footgun, see that function's doc). Chat's single per-account archive makes
+ * a plain `getMessageByStanzaId` lookup unambiguous.
+ *
+ * Returns `null` when the id is not cached (evicted, or the coverage record
+ * is stale) — the caller (`resolveCoverageBottom`) turns that into
+ * `'unresolvable'` rather than treating it as "nothing to resolve."
+ */
+export async function resolveArchivePosition(
+  entityId: string,
+  archiveId: string,
+  isRoom: boolean
+): Promise<OrderPosition | null> {
+  const message = isRoom
+    ? await getRoomMessageByStanzaId(entityId, archiveId)
+    : await getMessageByStanzaId(archiveId)
+  if (!message) return null
+  return {
+    timestamp: message.timestamp.getTime(),
+    archiveOrderKey: makeArchiveOrderKey(message, isRoom ? 'room' : 'chat'),
   }
 }
 

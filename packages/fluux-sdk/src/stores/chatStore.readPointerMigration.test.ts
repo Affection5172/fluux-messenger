@@ -57,7 +57,7 @@ describe('read pointer migration', () => {
 
   it('resolves the timestamp from the cache when only the id survived', async () => {
     const p = await migrateReadPointer(CONV, { lastSeenMessageId: 'm2' })
-    expect(p).toEqual({ messageId: 'm2', timestamp: at(2000) })
+    expect(p).toMatchObject({ messageId: 'm2', timestamp: at(2000) })
   })
 
   // Control: resolving to the OLDEST message AFTER lastReadAt would return m3
@@ -65,12 +65,12 @@ describe('read pointer migration', () => {
   // so it would destroy the position unrecoverably.
   it('resolves lastReadAt-only to the newest message AT OR BEFORE it', async () => {
     const p = await migrateReadPointer(CONV, { lastReadAt: at(2500) })
-    expect(p).toEqual({ messageId: 'm2', timestamp: at(2000) })
+    expect(p).toMatchObject({ messageId: 'm2', timestamp: at(2000) })
   })
 
   it('resolves exactly when lastReadAt lands on a message timestamp', async () => {
     const p = await migrateReadPointer(CONV, { lastReadAt: at(2000) })
-    expect(p).toEqual({ messageId: 'm2', timestamp: at(2000) })
+    expect(p).toMatchObject({ messageId: 'm2', timestamp: at(2000) })
   })
 
   it('yields no pointer when lastReadAt predates every cached message', async () => {
@@ -97,7 +97,7 @@ const STORAGE_KEY = buildScopedStorageKey('xmpp-chat-storage', JID)
 interface LegacyMeta {
   lastSeenMessageId?: string
   lastReadAt?: string
-  readPointer?: { messageId: string; timestamp: number }
+  readPointer?: { messageId: string; timestamp: number; archiveOrderKey?: unknown }
   unreadCount?: number
 }
 
@@ -137,9 +137,9 @@ describe('post-rehydrate readPointer backfill', () => {
     await chatStore.persist.rehydrate()
 
     await vi.waitFor(() => {
-      expect(pointerOf(CONV)).toEqual({ messageId: 'm2', timestamp: at(2000) })
-      expect(pointerOf(OTHER)).toEqual({ messageId: 'o1', timestamp: at(1500) })
-    })
+      expect(pointerOf(CONV)).toMatchObject({ messageId: 'm2', timestamp: at(2000) })
+      expect(pointerOf(OTHER)).toMatchObject({ messageId: 'o1', timestamp: at(1500) })
+    }, { timeout: 2000 })
   })
 
   // The both-fields branch resolves without touching the cache, so its
@@ -151,7 +151,7 @@ describe('post-rehydrate readPointer backfill', () => {
 
     await chatStore.persist.rehydrate()
 
-    await vi.waitFor(() => expect(pointerOf(CONV)).toEqual({ messageId: 'm2', timestamp: at(2000) }))
+    await vi.waitFor(() => expect(pointerOf(CONV)).toEqual({ messageId: 'm2', timestamp: at(2000) }), { timeout: 2000 })
   })
 
   // Both maps must move together: a pointer visible in conversationMeta but not
@@ -162,7 +162,7 @@ describe('post-rehydrate readPointer backfill', () => {
 
     await chatStore.persist.rehydrate()
 
-    await vi.waitFor(() => expect(pointerOf(CONV)).toBeDefined())
+    await vi.waitFor(() => expect(pointerOf(CONV)).toBeDefined(), { timeout: 2000 })
     expect(chatStore.getState().conversations.get(CONV)?.readPointer).toEqual(pointerOf(CONV))
   })
 
@@ -175,7 +175,7 @@ describe('post-rehydrate readPointer backfill', () => {
     persistConversations([[CONV, { lastSeenMessageId: 'm1' }]])
 
     await chatStore.persist.rehydrate()
-    await vi.waitFor(() => expect(release).toBeDefined())
+    await vi.waitFor(() => expect(release).toBeDefined(), { timeout: 2000 })
 
     // The user opens the conversation and reads to the live edge.
     const live = { messageId: 'm3', timestamp: at(3000) }
@@ -220,7 +220,7 @@ describe('post-rehydrate readPointer backfill', () => {
     ])
 
     await chatStore.persist.rehydrate()
-    await vi.waitFor(() => expect(pointerOf(OTHER)).toEqual({ messageId: 'o1', timestamp: at(1500) }))
+    await vi.waitFor(() => expect(pointerOf(OTHER)).toMatchObject({ messageId: 'o1', timestamp: at(1500) }), { timeout: 2000 })
 
     expect(pointerOf(CONV)).toEqual({ messageId: 'm1', timestamp: at(1000) })
   })
@@ -233,6 +233,64 @@ describe('post-rehydrate readPointer backfill', () => {
 
     expect(chatStore.getState().conversationMeta.get(CONV)?.unreadCount).toBe(4)
     expect(chatStore.getState().conversations.get(CONV)?.unreadCount).toBe(4)
+  })
+
+  // Task 2 (#1102): `deserializeState`'s NEW-FORMAT branch (conversationEntities +
+  // conversationMeta) round-trips the structured archiveOrderKey — asserted
+  // directly rather than assumed from the plain messageId/timestamp case above.
+  it('round-trips a persisted archiveOrderKey through the new-format deserialize branch', async () => {
+    persistConversations([
+      [CONV, { readPointer: { messageId: 'm2', timestamp: 2000, archiveOrderKey: { kind: 'chat', id: 'm2' } } }],
+    ])
+
+    await chatStore.persist.rehydrate()
+
+    expect(pointerOf(CONV)?.archiveOrderKey).toEqual({ kind: 'chat', id: 'm2' })
+    expect(chatStore.getState().conversations.get(CONV)?.readPointer?.archiveOrderKey).toEqual({
+      kind: 'chat',
+      id: 'm2',
+    })
+  })
+
+  // The legacy-format branch (no conversationEntities/conversationMeta on disk —
+  // pre-Task-6b combined `conversations` map) goes through the same
+  // `deserializeReadPointer` call and must round-trip the key too.
+  it('round-trips a persisted archiveOrderKey through the legacy-format deserialize branch', async () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        state: {
+          conversations: [
+            [CONV, {
+              id: CONV,
+              name: CONV,
+              type: 'chat',
+              unreadCount: 0,
+              readPointer: { messageId: 'm2', timestamp: 2000, archiveOrderKey: { kind: 'chat', id: 'm2' } },
+            }],
+          ],
+          archivedConversations: [],
+        },
+      })
+    )
+
+    await chatStore.persist.rehydrate()
+
+    expect(pointerOf(CONV)?.archiveOrderKey).toEqual({ kind: 'chat', id: 'm2' })
+  })
+
+  // A malformed persisted key must be DROPPED at this real persistence surface
+  // too, not just at the deserializeReadPointer unit level — the pointer itself
+  // (messageId/timestamp) survives.
+  it('drops a malformed persisted archiveOrderKey but keeps the rest of the pointer', async () => {
+    persistConversations([
+      [CONV, { readPointer: { messageId: 'm2', timestamp: 2000, archiveOrderKey: { kind: 'room', id: 'm2' } } }],
+    ])
+
+    await chatStore.persist.rehydrate()
+
+    expect(pointerOf(CONV)?.archiveOrderKey).toBeUndefined() // missing `from` → invalid → dropped
+    expect(pointerOf(CONV)?.messageId).toBe('m2')
   })
 })
 
@@ -313,7 +371,7 @@ describe('unmigrated legacy read state survives the persist', () => {
     ] as never)
 
     relaunch()
-    await vi.waitFor(() => expect(pointerOf(LATE)).toEqual({ messageId: 'late1', timestamp: at(1500) }))
+    await vi.waitFor(() => expect(pointerOf(LATE)).toMatchObject({ messageId: 'late1', timestamp: at(1500) }), { timeout: 2000 })
   })
 
   // The other half of the same guarantee, for the id-only shape.
@@ -335,12 +393,16 @@ describe('unmigrated legacy read state survives the persist', () => {
     persistConversations([[CONV, { lastSeenMessageId: 'm2' }]])
 
     relaunch()
-    await vi.waitFor(() => expect(pointerOf(CONV)).toEqual({ messageId: 'm2', timestamp: at(2000) }))
+    // toMatchObject: this path resolves the message from cache and stamps an
+    // archiveOrderKey onto the pointer (unlike the both-fields branch above,
+    // which copies the legacy pair through verbatim) — the point of this
+    // assertion is messageId/timestamp, not the archive key's exact shape.
+    await vi.waitFor(() => expect(pointerOf(CONV)).toMatchObject({ messageId: 'm2', timestamp: at(2000) }), { timeout: 2000 })
     // This assertion means to observe the final persisted blob, not a
     // mid-pass write still sitting in the throttle's pending thunk.
     flushThrottledStorage()
 
-    expect(diskEntry('conversationMeta', CONV).readPointer).toEqual({
+    expect(diskEntry('conversationMeta', CONV).readPointer).toMatchObject({
       messageId: 'm2',
       timestamp: at(2000).toISOString(),
     })
@@ -442,7 +504,7 @@ describe('catch-up hydration does not fabricate a pointer over un-migrated read 
     // Launch 2: the cache can answer now. The pointer lands where the user
     // actually was — BEHIND the two messages a snap would have marked read.
     relaunch()
-    await vi.waitFor(() => expect(pointerOf(LATE)).toEqual({ messageId: 'l1', timestamp: at(1500) }))
+    await vi.waitFor(() => expect(pointerOf(LATE)).toMatchObject({ messageId: 'l1', timestamp: at(1500) }), { timeout: 2000 })
   })
 
   // Control: the stand-down is per-conversation, not a blanket disable. FRESH is
@@ -461,7 +523,7 @@ describe('catch-up hydration does not fabricate a pointer over un-migrated read 
 
     chatStore.getState().mergeMAMMessages(FRESH, archivePage(FRESH, 'f', [1500, 2500, 3500]), {}, true, 'forward')
 
-    expect(pointerOf(FRESH)).toEqual({ messageId: 'f3', timestamp: at(3500) })
+    expect(pointerOf(FRESH)).toMatchObject({ messageId: 'f3', timestamp: at(3500) })
     expect(chatStore.getState().conversationMeta.get(FRESH)?.unreadCount).toBe(0)
     // The other conversation in the same blob is untouched, which is what makes
     // this a control rather than two independent runs.
