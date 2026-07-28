@@ -170,12 +170,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # The Playwright webServer runs `npm run dev` (vite), which imports @fluux/sdk.
-      # The dev build is required because the harness relies on import.meta.env.DEV
-      # test seams (__fluuxGetVirtOffset / __fluuxTriggerLoadOlder) that are stripped
-      # from production builds.
-      - name: Build SDK
-        run: npm run build:sdk
+      # No Build SDK step: the Playwright webServer runs `npm run build:e2e`, which builds
+      # the SDK and then the bundled demo the suites load. That build keeps development
+      # semantics — the harness relies on import.meta.env.DEV seams (__fluuxGetVirtOffset /
+      # __fluuxTriggerLoadOlder / __fluuxTriggerMediaLoad) that a production build strips —
+      # and asserts those seams are present before the suites start.
 
       # Cache the browser binaries (~/.cache/ms-playwright) so a slow CDN can't add minutes to
       # the download. Caches created in pull_request runs are scoped to that PR, so the shared
@@ -222,19 +221,19 @@ jobs:
       - name: Install Playwright OS dependencies
         run: npx playwright install-deps chromium webkit
 
+      # Scroll positioning + composer box-model invariants, both engines, in one
+      # Playwright run so they share a single dev server and keep both workers fed.
+      #
+      # The composer half cannot be unit tested: jsdom has no layout, so the autosize
+      # unit tests mock scrollHeight — and a mocked measurement can never contradict
+      # the real box model, which is where both shipped composer bugs lived. WebKit
+      # matters specifically: it reserves scrollbar gutters differently from Blink,
+      # and it is the engine the desktop app runs.
+      #
       # CI=true is set by GitHub Actions → the config enables retries(2), forbidOnly,
       # and the github + html reporters. Blocks the PR if any invariant regresses.
-      - name: Run scroll invariants (chromium + webkit)
-        run: npm run test:scroll
-
-      # Composer box-model invariants. These cannot be unit tested: jsdom has no
-      # layout, so the autosize unit tests mock scrollHeight — and a mocked
-      # measurement can never contradict the real box model, which is where both
-      # shipped composer bugs lived. WebKit matters specifically here: it reserves
-      # scrollbar gutters differently from Blink, and it is the engine the desktop
-      # app runs.
-      - name: Run composer geometry invariants (chromium + webkit)
-        run: npm run test:composer
+      - name: Run scroll + composer invariants (chromium + webkit)
+        run: npm run test:e2e
 
       - name: Upload Playwright report on failure
         if: failure()
