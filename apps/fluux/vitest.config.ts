@@ -10,6 +10,10 @@ export default defineConfig({
     // Tests run as 'development', so the instrumentation is on unless a run
     // explicitly sets FLUUX_ANOMALY=0.
     __FLUUX_ANOMALY__: JSON.stringify(resolveAnomalyGate('development', process.env)),
+    // Mirrors vite.config.ts. Any module reading a build-time constant is
+    // untestable without these — the values themselves are irrelevant here.
+    __APP_VERSION__: JSON.stringify('0.0.0-test'),
+    __GIT_COMMIT__: JSON.stringify('testsha'),
   },
   resolve: {
     alias: {
@@ -24,7 +28,7 @@ export default defineConfig({
     environment: 'happy-dom',
     silent: true,
     setupFiles: ['./src/test-setup.ts'],
-    include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
+    include: ['src/**/*.test.ts', 'src/**/*.test.tsx', 'scripts/**/*.test.ts'],
     exclude: ['src/**/*.manual.test.ts'],
     coverage: {
       provider: 'v8',

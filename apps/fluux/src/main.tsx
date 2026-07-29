@@ -139,6 +139,13 @@ window.addEventListener('vite:preloadError', async (event) => {
   window.location.reload()
 })
 
+// Anomaly instrumentation. A `lazy` import inside a statically-false branch means
+// Rollup does not merely skip the code — it never emits the chunk. See
+// src/anomaly/gate.ts for the build matrix.
+const AnomalyInstaller = __FLUUX_ANOMALY__
+  ? React.lazy(() => import('./anomaly/AnomalyInstaller'))
+  : null
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <RenderLoopBoundary>
@@ -147,6 +154,11 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
         proxyAdapter={proxyAdapter}
         shouldAutoReconnect={() => getReconnectIntent() === 'active'}
       >
+        {AnomalyInstaller && (
+          <React.Suspense fallback={null}>
+            <AnomalyInstaller />
+          </React.Suspense>
+        )}
         <ThemeProvider>
           <HashRouter useTransitions={ROUTER_USE_TRANSITIONS}>
             <App />
