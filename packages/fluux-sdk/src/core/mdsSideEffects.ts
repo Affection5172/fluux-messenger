@@ -21,6 +21,12 @@
  * session never managed to publish is retried without waiting for a further
  * local read advance (#1145).
  *
+ * Read positions resolve from resident state first and from the IndexedDB
+ * message cache second (#1175), so a BACKGROUNDED entity — which keeps no
+ * resident message array — still resolves and publishes. That makes resolution
+ * asynchronous, so `consider()` runs as a LATEST-WINS SERIAL DRAIN per JID and
+ * revalidates every input after the await; see `consider`/`considerOnce`.
+ *
  * @module Core/MdsSideEffects
  */
 
@@ -32,11 +38,35 @@ import { connectionStore } from '../stores/connectionStore'
 import { roomStore } from '../stores/roomStore'
 import { createKeyedCoalescer } from '../utils/keyedCoalescer'
 import { compareOrder, makeArchiveOrderKey, type OrderPosition } from '../stores/shared/readState'
+import type { ReadPointer } from '../stores/shared/readPointer'
 import { getBareJid } from './jid'
 import { logInfo } from './logger'
+import * as messageCache from '../utils/messageCache'
+import { getStorageScopeJid } from '../utils/storageScope'
 
 /** Debounce window for read-position publishes (ms). */
 const PUBLISH_DEBOUNCE_MS = 1_500
+
+/**
+ * How many cached rows at or behind the pointer the cache resolution reads.
+ *
+ * Fifty rows is one small page: enough to cover a short unresolved own-send tail
+ * without making every retry scan an unbounded archive. The pointer's OWN row is
+ * the newest thing at or behind itself, so this window resolves the exact
+ * position whenever it is cached, and degrades into the at-or-behind fallback
+ * only when it is not resolvable. Bounding it keeps the read cheap on the path
+ * that cannot resolve at all (a 1:1 whose whole tail is our own unarchived
+ * sends), where nothing may be committed as handled and the lookup therefore
+ * re-runs on later store changes.
+ *
+ * The IndexedDB `conv_timestamp` index bounds these 50 rows by TIMESTAMP ALONE;
+ * `newestResolvableAtOrBehind` applies archive-order filtering afterwards.
+ * More than 50 rows sharing the pointer's millisecond and sorting after it can
+ * therefore crowd the pointer row out. That containment deliberately fails in
+ * the safe UNDER-ADVANCE direction: the position stays unresolved and retryable,
+ * and is never published ahead of the true read position.
+ */
+const CACHE_LOOKBACK = 50
 
 /**
  * Sets up the MDS read-position publisher side effect.
@@ -63,12 +93,12 @@ export function setupMdsSideEffects(
   let nodeRevision = 0
   let nodeSnapshotAuthoritative = false
   const currentSessionConfirmedNodeJids = new Set<string>()
-  // The read-pointer message id we last HANDLED per JID, to detect advances.
+  // The full read-pointer identity we last HANDLED per JID, to detect advances.
   // "Handled" means the position was resolved to a stanza-id and then either
   // enqueued or judged not ahead of the node — never merely "seen". A position
   // that could not be resolved stays out of this map so a later merge retries
   // it (#1142); recording it would silence the position for good.
-  const lastConsideredSeenId = new Map<string, string | undefined>()
+  const lastConsideredPointerIdentity = new Map<string, string>()
   // Seed markers (jid → marker) whose JID was NOT a known room at seed time.
   // The fresh-session seed runs before bookmarks load (roomStore.rooms is empty),
   // so a room's marker would otherwise route to chat and be dropped. We stash it
@@ -78,6 +108,17 @@ export function setupMdsSideEffects(
   // Live conversation/room JIDs, to detect user deletes (retraction). Maintained
   // while disarmed; the removed delta is retracted only while armed (syncEnabled).
   let trackedJids = new Set<string>()
+  // Latest-wins serial drain state: the JIDs whose resolution is in flight, and
+  // the JIDs owed another pass because they changed during one. See consider().
+  const resolutionInFlight = new Set<string>()
+  const resolutionOwed = new Set<string>()
+  // Bumped whenever the session boundary moves (fresh seed, disconnect). A
+  // resolution that spans a bump was ordered against node state the new session
+  // has re-derived, so it is discarded rather than published.
+  let sessionEpoch = 0
+  // Set by the returned teardown, so a resolution still in flight cannot publish
+  // after the side effect has been unsubscribed.
+  let disposed = false
 
   function recordKnownNodeStanzaId(jid: string, stanzaId: string): void {
     lastKnownNodeStanzaId.set(jid, stanzaId)
@@ -216,7 +257,7 @@ export function setupMdsSideEffects(
    *   replies", which no receiver derives anything from, because unread
    *   counting excludes outgoing messages everywhere.
    *
-   * Rooms deliberately do NOT get this fallback — see {@link resolveSeenStanzaId}.
+   * Rooms deliberately do NOT get this fallback — see {@link resolveFromStores}.
    */
   function newestResolvableAtOrBehind(
     messages: Array<{ stanzaId?: string; from?: string; id: string; timestamp: Date }>,
@@ -239,6 +280,39 @@ export function setupMdsSideEffects(
     return best?.stanzaId
   }
 
+  function readPointer(jid: string): ReadPointer | undefined {
+    return isRoom(jid)
+      ? roomStore.getState().roomMeta.get(jid)?.readPointer
+      : chatStore.getState().conversationMeta.get(jid)?.readPointer
+  }
+
+  function pointerIdentity(pointer: ReadPointer | undefined): string | undefined {
+    if (!pointer) return undefined
+    const key = pointer.archiveOrderKey
+    return JSON.stringify([
+      pointer.messageId,
+      pointer.timestamp.getTime(),
+      key?.kind ?? null,
+      key?.kind === 'room' ? key.from : null,
+      key?.id ?? null,
+    ])
+  }
+
+  /**
+   * Resolve the exact `(sender, id)` target named by a room pointer.
+   *
+   * Room client ids are unique only per sender. Without a room archive-order
+   * key, choosing any matching row would risk publishing a WRONG forward-only
+   * MDS position that no device can walk back. Refusing to resolve preserves the
+   * exact-position contract and costs only a retryable delay.
+   */
+  function exactRoomPointerTarget(jid: string): { messageId: string; from: string } | undefined {
+    const pointer = roomStore.getState().roomMeta.get(jid)?.readPointer
+    const key = pointer?.archiveOrderKey
+    if (!pointer?.messageId || key?.kind !== 'room' || key.from.length === 0) return undefined
+    return { messageId: pointer.messageId, from: key.from }
+  }
+
   /**
    * Resolve the stanza-id of the message a conversation's/room's read pointer names.
    *
@@ -251,19 +325,20 @@ export function setupMdsSideEffects(
    * stanza-ids at all would have nothing resolvable at or behind the pointer for
    * a fallback to find. So the asymmetry is the point, not an omission.
    */
-  function resolveSeenStanzaId(jid: string): string | undefined {
+  function resolveFromStores(jid: string): string | undefined {
     if (isRoom(jid)) {
-      const seenId = roomStore.getState().roomMeta.get(jid)?.readPointer?.messageId
-      if (!seenId) return undefined
+      const target = exactRoomPointerTarget(jid)
+      if (!target) return undefined
+      const { messageId: seenId, from } = target
       const messages = roomStore.getState().roomRuntime.get(jid)?.messages ?? []
-      const fromSlice = messages.find((m) => m.id === seenId)?.stanzaId
+      const fromSlice = messages.find((m) => m.id === seenId && m.from === from)?.stanzaId
       if (fromSlice) return fromSlice
       // Non-active rooms keep no resident array (memory windowing); mark-all-read
       // points at the newest known message, whose stanza-id survives on the
       // lastMessage preview.
       const last = roomStore.getState().roomMeta.get(jid)?.lastMessage
         ?? roomStore.getState().rooms.get(jid)?.lastMessage
-      return last?.id === seenId ? last.stanzaId : undefined
+      return last?.id === seenId && last.from === from ? last.stanzaId : undefined
     }
     const pointer = chatStore.getState().conversationMeta.get(jid)?.readPointer
     const seenId = pointer?.messageId
@@ -279,6 +354,66 @@ export function setupMdsSideEffects(
     // state once the user has replied. Publish the newest position we CAN
     // address at or behind it rather than staying silent for the session.
     return newestResolvableAtOrBehind(messages, pointer)
+  }
+
+  /**
+   * Resolve the pointer from the IndexedDB message cache (#1175).
+   *
+   * The store-backed resolution above can only see what is RESIDENT, and a
+   * backgrounded entity keeps no resident array at all — `setActiveConversation`
+   * deletes the entry. Its position therefore stayed unresolved until something
+   * happened to re-trigger it. The cache is the same archive, minus the memory
+   * windowing, so reading it closes that gap.
+   *
+   * The chat branch reads ONE bounded window — the newest {@link CACHE_LOOKBACK}
+   * cached rows at or before the pointer's timestamp — and hands it to the same
+   * {@link newestResolvableAtOrBehind} the resident fallback uses. That is
+   * deliberately one code path for two jobs: the pointer's own row is the newest
+   * thing at or behind itself, so an exactly-resolvable pointer yields its own
+   * stanza-id, and only an unresolvable one degrades to the #1189 approximation.
+   * Ordering against the pointer is what makes it safe in the direction that
+   * matters — a row newer than the pointer can never be selected, so this cannot
+   * publish ahead of the true read position, exactly as for the resident scan.
+   *
+   * Rooms keep the exact-position contract and get NO at-or-behind fallback, in
+   * the cache as in memory — see {@link resolveFromStores} for why.
+   */
+  async function resolveFromCache(jid: string): Promise<string | undefined> {
+    if (!messageCache.isMessageCacheAvailable()) return undefined
+    if (isRoom(jid)) {
+      const target = exactRoomPointerTarget(jid)
+      if (!target) return undefined
+      const cached = await messageCache.getRoomMessage(jid, target.messageId, target.from)
+      return cached?.stanzaId
+    }
+    const pointer = chatStore.getState().conversationMeta.get(jid)?.readPointer
+    if (!pointer?.messageId) return undefined
+    // `before` is an exclusive upper bound, so probe one millisecond past the
+    // pointer to include the message sitting exactly on it; it also forces the
+    // backwards cursor, so `limit` yields the NEWEST rows rather than the
+    // oldest. `after` pins the range's lower end inside this conversation —
+    // without it the cursor walks every lower-sorting conversation's rows when
+    // this one has nothing to return (see messageCache.entityTimestampRange).
+    const rows = await messageCache.getMessages(jid, {
+      after: new Date(0),
+      before: new Date(pointer.timestamp.getTime() + 1),
+      limit: CACHE_LOOKBACK,
+    })
+    return newestResolvableAtOrBehind(rows, pointer)
+  }
+
+  /**
+   * Resolve the pointer, resident state first and the cache second.
+   *
+   * Ordering is a cost decision, not a correctness one: both sources answer with
+   * a position at or behind the pointer, so neither can over-advance. Preferring
+   * the resident answer keeps every case that resolves today free of an
+   * IndexedDB read — including the active-conversation #1189 fallback, where the
+   * cached copy of an own send has no stanza-id either, so the read could not
+   * have improved on it.
+   */
+  async function resolveSeenStanzaId(jid: string): Promise<string | undefined> {
+    return resolveFromStores(jid) ?? (await resolveFromCache(jid))
   }
 
   /**
@@ -324,18 +459,18 @@ export function setupMdsSideEffects(
       // buffered during the awaits above: the next meta change re-considers the
       // CURRENT pointer and re-checks this gate then.
       if (!archiveIsTrustworthy(jid)) {
-        lastConsideredSeenId.delete(jid)
+        lastConsideredPointerIdentity.delete(jid)
         continue
       }
       const by = stanzaIdBy(jid)
       if (!by) {
         // Own JID unknown (should not happen while online) — same re-arm.
-        lastConsideredSeenId.delete(jid)
+        lastConsideredPointerIdentity.delete(jid)
         continue
       }
       const decision = publishDecision(jid, stanzaId)
       if (decision === 'retry') {
-        lastConsideredSeenId.delete(jid)
+        lastConsideredPointerIdentity.delete(jid)
         continue
       }
       if (decision === 'skip') continue
@@ -389,26 +524,59 @@ export function setupMdsSideEffects(
     return !mam.isLoading && mam.isCaughtUpToLive
   }
 
-  /** Consider a conversation/room for publishing if its read position advanced. */
-  function consider(jid: string): void {
+  /**
+   * One consideration pass for a conversation/room: resolve its read position
+   * and enqueue it if it advanced.
+   *
+   * Resolution can touch IndexedDB, so this is async and every input it was
+   * computed against is revalidated after the await. A change to any of them
+   * invalidates the in-flight result INSTEAD of publishing it: the de-dup key
+   * stays uncommitted, so the position is re-considered rather than silenced.
+   * The account checks are not hypothetical — a cross-account pointer write of
+   * this shape was found during #1155.
+   */
+  async function considerOnce(jid: string): Promise<void> {
     if (!syncEnabled) return
     // Catch-up gate: never publish a position derived from a partial archive.
     // Skipping leaves the de-dup key unchanged; MAM-state changes re-consider
     // the current pointer once catch-up becomes trustworthy.
     if (!archiveIsTrustworthy(jid)) return
 
-    const seenId = isRoom(jid)
-      ? roomStore.getState().roomMeta.get(jid)?.readPointer?.messageId
-      : chatStore.getState().conversationMeta.get(jid)?.readPointer?.messageId
-    if (seenId === lastConsideredSeenId.get(jid)) return
+    const pointer = readPointer(jid)
+    const identity = pointerIdentity(pointer)
+    if (!identity || identity === lastConsideredPointerIdentity.get(jid)) return
 
-    const stanzaId = resolveSeenStanzaId(jid)
-    // No resolvable stanza-id yet: the entity's resident array is evicted and
-    // the pointer doesn't name the lastMessage preview. Leave the de-dup key
-    // UNCOMMITTED so the next meta change re-runs this resolve — committing it
-    // here would make every later call short-circuit on the equality check
-    // above, and the position would never be enqueued nor reach the node
-    // (#1142). The key means "this position is handled", not "we have seen it".
+    // Captured BEFORE the await, compared after it.
+    const epoch = sessionEpoch
+    const scope = getStorageScopeJid()
+    const owner = ownBareJid()
+    const wasRoom = isRoom(jid)
+
+    const stanzaId = await resolveSeenStanzaId(jid)
+
+    // Teardown, or a session that ended or restarted (a new seed re-derives the
+    // node state this result was ordered against).
+    if (disposed) return
+    if (!syncEnabled || sessionEpoch !== epoch) return
+    if (connectionStore.getState().status !== 'online') return
+    // Account: the storage scope the cache was read under, and the JID we would
+    // publish as. Either changing means this value belongs to another account.
+    if (getStorageScopeJid() !== scope || ownBareJid() !== owner) return
+    // Classification: a bookmark landing mid-flight moves the entity to the room
+    // stores and changes the XEP-0359 `by` we would publish under.
+    if (isRoom(jid) !== wasRoom) return
+    // The position itself: a newer pointer supersedes this one. The store
+    // subscription that moved it has already asked for another pass.
+    if (pointerIdentity(readPointer(jid)) !== identity) return
+    if (!archiveIsTrustworthy(jid)) return
+
+    // No resolvable stanza-id: neither the resident slice nor the cache can
+    // address the pointer — in 1:1 the permanent state when the whole tail is
+    // our own unarchived sends. Leave the de-dup key UNCOMMITTED so the next
+    // meta change re-runs this resolve — committing it here would make every
+    // later call short-circuit on the equality check above, and the position
+    // would never be enqueued nor reach the node (#1142). The key means "this
+    // position is handled", not "we have seen it".
     if (!stanzaId) return
 
     // No regressive publish: only publish when we can show the position is not
@@ -422,11 +590,45 @@ export function setupMdsSideEffects(
     // Resolved AND ordered → handled from here on, whether we enqueue below or
     // decide the node is already at/ahead of it. Enqueued positions are checked
     // again at flush time because live node state can change during the debounce.
-    lastConsideredSeenId.set(jid, seenId)
+    lastConsideredPointerIdentity.set(jid, identity)
     if (decision === 'skip') return
 
     dirty.add(jid, stanzaId)
     schedulePublish()
+  }
+
+  /**
+   * Consider a conversation/room, serialised per JID with LATEST-WINS semantics.
+   *
+   * At most one resolution is in flight per JID; a call arriving during it marks
+   * another pass as owed and the drain re-runs when the current one finishes.
+   *
+   * A bare in-flight guard — suppressing the second call — would be WRONG: A is
+   * in flight, B arrives and is dropped, A completes, and nothing ever retries
+   * B. The position B named would then never be published, which is exactly the
+   * failure #1142 fixed. Re-running is what keeps it latest-wins: the rerun
+   * re-reads the CURRENT pointer, so the newest position is the one considered,
+   * however many were coalesced into the one owed pass.
+   */
+  function consider(jid: string): void {
+    if (!syncEnabled) return
+    if (resolutionInFlight.has(jid)) {
+      resolutionOwed.add(jid)
+      return
+    }
+    resolutionInFlight.add(jid)
+    void (async () => {
+      try {
+        do {
+          // Cleared BEFORE the pass so a request arriving DURING it is kept.
+          resolutionOwed.delete(jid)
+          await considerOnce(jid)
+        } while (resolutionOwed.has(jid) && !disposed)
+      } finally {
+        resolutionInFlight.delete(jid)
+        resolutionOwed.delete(jid)
+      }
+    })()
   }
 
   /** Current live set: 1:1 conversation entities ∪ known rooms. */
@@ -448,8 +650,9 @@ export function setupMdsSideEffects(
     lastKnownNodeStanzaId.delete(jid)
     lastKnownNodeRevision.delete(jid)
     currentSessionConfirmedNodeJids.delete(jid)
-    lastConsideredSeenId.delete(jid)
+    lastConsideredPointerIdentity.delete(jid)
     unroutedSeedMarkers.delete(jid)
+    resolutionOwed.delete(jid)
     dirty.delete(jid)
   }
 
@@ -567,6 +770,7 @@ export function setupMdsSideEffects(
   // disabled for the whole async seed so the seeded positions aren't republished.
   const unsubscribeOnline = client.on('online', () => {
     syncEnabled = false
+    sessionEpoch++
     nodeSnapshotAuthoritative = false
     currentSessionConfirmedNodeJids.clear()
     void (async () => {
@@ -580,7 +784,7 @@ export function setupMdsSideEffects(
 
       dirty.drop()
       dirty.open()
-      lastConsideredSeenId.clear()
+      lastConsideredPointerIdentity.clear()
 
       if (result.status === 'unknown') {
         syncEnabled = true
@@ -676,10 +880,13 @@ export function setupMdsSideEffects(
   // SM resumption: server replays notifications; keep publishing enabled, no reseed.
   const unsubscribeResumed = client.on('resumed', () => {
     dirty.open()
+    lastConsideredPointerIdentity.clear()
     syncEnabled = true
     // Rebuild the delete-detection baseline to the current live set (mirrors the
     // fresh-session handler) so a resume's known entities aren't seen as deletes.
     trackedJids = liveJids()
+    considerConversations()
+    considerRooms()
   })
 
   // On disconnect: DROP pending work and cancel the timer. The canonical pointer
@@ -690,6 +897,7 @@ export function setupMdsSideEffects(
     (status) => {
       if (status !== 'online' && previousStatus === 'online') {
         syncEnabled = false
+        sessionEpoch++
         // Clear the delete-detection baseline: a teardown is not a delete.
         trackedJids = new Set()
         dirty.drop()
@@ -704,6 +912,8 @@ export function setupMdsSideEffects(
   )
 
   return () => {
+    disposed = true
+    resolutionOwed.clear()
     unsubscribeConversationMeta()
     unsubscribeMessages()
     unsubscribeConversationMam()
