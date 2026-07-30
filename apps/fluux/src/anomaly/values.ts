@@ -115,6 +115,9 @@ export const ID = Object.freeze({
   resizeLoop: mint('scroll/resize-loop', 'id'),
   slowCorrection: mint('scroll/slow-correction', 'id'),
   mainThreadStall: mint('perf/main-thread-stall', 'id'),
+  unreadSurvivesFocus: mint('read-state/unread-survives-focus', 'id'),
+  fabAtLiveEdge: mint('scroll/fab-at-live-edge', 'id'),
+  jumpTargetMiss: mint('scroll/jump-target-miss', 'id'),
 })
 
 /** Permitted `ctx` keys. */
@@ -130,6 +133,12 @@ export const CTX = Object.freeze({
   rows: mint('rows', 'ctx'),
   /** Measured window length, where a count alone would not be interpretable. */
   elapsedMs: mint('elapsedMs', 'ctx'),
+  /** Independently measured distance from the content bottom, in px. */
+  distFromBottom: mint('distFromBottom', 'ctx'),
+  /** How long a condition had held continuously when it was reported. */
+  heldMs: mint('heldMs', 'ctx'),
+  /** Signed px by which a jump target sat outside the viewport. */
+  offBy: mint('offBy', 'ctx'),
 })
 
 /**
