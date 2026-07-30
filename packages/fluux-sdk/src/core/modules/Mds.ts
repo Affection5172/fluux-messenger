@@ -3,6 +3,7 @@ import type { Element } from '@xmpp/client'
 import { getBareJid } from '../jid'
 import { generateUUID } from '../../utils/uuid'
 import { NS_PUBSUB, NS_MDS, NS_CHAT_MARKERS, NS_STANZA_ID } from '../namespaces'
+import { hasErrorCondition } from '../../utils/xmppError'
 import type { ModuleDependencies } from './BaseModule'
 
 /** A per-conversation last-displayed marker (XEP-0490). */
@@ -17,6 +18,25 @@ export interface DisplayedMarker {
    * cannot read that shape — the consumer should republish it in spec format.
    */
   legacy?: boolean
+}
+
+export type DisplayedMarkerFetchResult =
+  | { status: 'authoritative'; markers: DisplayedMarker[] }
+  | { status: 'unknown' }
+
+/**
+ * Is this rejection the server telling us the MDS node does not exist?
+ *
+ * That answer is AUTHORITATIVE — there is genuinely nothing published — and the
+ * distinction matters: a brand-new account has no node, and reading its absence
+ * as "unknown" would stop the read-position seed from ever publishing.
+ *
+ * Uses the shared {@link hasErrorCondition} rather than matching `.condition`
+ * directly, so a server that carries the condition only in the error text is
+ * still recognised.
+ */
+function isMissingNodeError(error: unknown): boolean {
+  return hasErrorCondition(error, 'item-not-found')
 }
 
 /**
@@ -52,8 +72,8 @@ export function parseMdsItems(itemsEl: Element): DisplayedMarker[] {
  *
  * Publishes/fetches the per-conversation last-displayed stanza-id to the private
  * PEP node `urn:xmpp:mds:displayed:0` (item id = conversation bare JID, payload =
- * an XEP-0333 `<displayed/>`). Request/response only — incoming `+notify` events
- * are handled in PubSub.
+ * an XEP-0490 `<displayed/>` wrapper containing an XEP-0359 `<stanza-id/>`).
+ * Request/response only — incoming `+notify` events are handled in PubSub.
  */
 export class Mds {
   private deps: ModuleDependencies
@@ -124,12 +144,22 @@ export class Mds {
   }
 
   /**
-   * Fetch all per-conversation displayed markers from our own MDS node.
-   * Returns an empty array if the node does not exist yet.
+   * Best-effort fetch of all displayed markers from our own MDS node.
+   * Returns an empty array when the node is absent or its state is unavailable.
    */
   async fetchAllDisplayed(timeoutMs?: number): Promise<DisplayedMarker[]> {
+    const result = await this.fetchAllDisplayedResult(timeoutMs)
+    return result.status === 'authoritative' ? result.markers : []
+  }
+
+  /**
+   * Fetch all displayed markers while preserving whether the node response was
+   * authoritative. A missing node is authoritative and contains no markers;
+   * transport, timeout, and unexpected failures are unknown.
+   */
+  async fetchAllDisplayedResult(timeoutMs?: number): Promise<DisplayedMarkerFetchResult> {
     const currentJid = this.deps.getCurrentJid()
-    if (!currentJid) return []
+    if (!currentJid) return { status: 'unknown' }
 
     const bareJid = getBareJid(currentJid)
     const iq = xml('iq', { type: 'get', to: bareJid, id: `mds_get_${generateUUID()}` },
@@ -141,10 +171,15 @@ export class Mds {
     try {
       const result = await this.deps.sendIQ(iq, timeoutMs)
       const items = result.getChild('pubsub', NS_PUBSUB)?.getChild('items')
-      if (!items) return []
-      return parseMdsItems(items)
-    } catch {
-      return []
+      if (!items) return { status: 'unknown' }
+      return {
+        status: 'authoritative',
+        markers: parseMdsItems(items),
+      }
+    } catch (error) {
+      return isMissingNodeError(error)
+        ? { status: 'authoritative', markers: [] }
+        : { status: 'unknown' }
     }
   }
 }
