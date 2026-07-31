@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { RoomHatsModal } from './RoomHatsModal'
@@ -13,7 +14,24 @@ const mockListHatAssignments = vi.fn()
 const mockAssignHat = vi.fn()
 const mockUnassignHat = vi.fn()
 
+// Mirrors the SDK's HatCommandError closely enough for `instanceof` in
+// getHatCommandErrorMessage; this suite deliberately avoids the SDK barrel, so
+// the class is hoisted alongside the mock factory that exposes it.
+const { MockHatCommandError } = vi.hoisted(() => ({
+  MockHatCommandError: class HatCommandError extends Error {
+    condition: string
+    text?: string
+    constructor(condition: string, text?: string) {
+      super(text || condition)
+      this.name = 'HatCommandError'
+      this.condition = condition
+      this.text = text
+    }
+  },
+}))
+
 vi.mock('@fluux/sdk', () => ({
+  HatCommandError: MockHatCommandError,
   useRoomModeration: () => ({
     listHats: mockListHats,
     createHat: mockCreateHat,
@@ -56,6 +74,7 @@ vi.mock('react-i18next', () => ({
         'rooms.hatDestroyError': 'Failed to destroy hat',
         'rooms.hatAssignError': 'Failed to assign hat',
         'rooms.hatUnassignError': 'Failed to unassign hat',
+        'rooms.hatCommandNoReply': 'The server did not reply',
         'rooms.selectHat': 'Select hat',
         'rooms.hatJidPlaceholder': 'user@example.com',
         'common.close': 'Close',
@@ -156,6 +175,19 @@ const mockAddToast = vi.fn()
 function renderModal(room?: Room) {
   return render(
     <RoomHatsModal room={room ?? createRoom()} onClose={mockOnClose} />
+  )
+}
+
+/**
+ * StrictMode double-invokes effects on the *same* component instance: mount →
+ * cleanup → mount. A mounted-guard ref that is only cleared, never re-armed,
+ * stays false for the life of the modal.
+ */
+function renderModalStrict(room?: Room) {
+  return render(
+    <StrictMode>
+      <RoomHatsModal room={room ?? createRoom()} onClose={mockOnClose} />
+    </StrictMode>
   )
 }
 
@@ -782,6 +814,68 @@ describe('RoomHatsModal', () => {
       await waitFor(() => {
         // After assignments load, should also show their count
         expect(mockListHatAssignments).toHaveBeenCalled()
+      })
+    })
+  })
+
+  // ---------- StrictMode lifecycle -----------------------------------------
+
+  describe('StrictMode double-invoke', () => {
+    it('still renders the loaded hats after the dev mount/cleanup/mount cycle', async () => {
+      renderModalStrict()
+
+      await waitFor(() => {
+        expect(screen.getByText('Moderator')).toBeInTheDocument()
+        expect(screen.getByText('urn:hat:moderator')).toBeInTheDocument()
+      })
+    })
+
+    it('still surfaces a load failure toast after the dev mount/cleanup/mount cycle', async () => {
+      mockListHats.mockRejectedValue(new Error('boom'))
+      renderModalStrict()
+
+      await waitFor(() => {
+        expect(mockAddToast).toHaveBeenCalledWith('error', 'Failed to create hat')
+      })
+    })
+  })
+
+  // ---------- Failure causes ------------------------------------------------
+
+  describe('Failure causes', () => {
+    it('names an unanswered command instead of showing a bare failure string', async () => {
+      renderModal()
+      await waitFor(() => expect(screen.getByText('Moderator')).toBeInTheDocument())
+
+      mockDestroyHat.mockRejectedValue(new MockHatCommandError('timeout'))
+
+      fireEvent.click(screen.getAllByTitle('Delete')[0])
+      fireEvent.click(screen.getByTestId('confirm-yes'))
+
+      await waitFor(() => {
+        expect(mockAddToast).toHaveBeenCalledWith(
+          'error',
+          'Failed to destroy hat — The server did not reply',
+        )
+      })
+    })
+
+    it("shows the server's own explanation when it refused", async () => {
+      renderModal()
+      await waitFor(() => expect(screen.getByText('Moderator')).toBeInTheDocument())
+
+      mockDestroyHat.mockRejectedValue(
+        new MockHatCommandError('forbidden', 'Only owners may manage hats')
+      )
+
+      fireEvent.click(screen.getAllByTitle('Delete')[0])
+      fireEvent.click(screen.getByTestId('confirm-yes'))
+
+      await waitFor(() => {
+        expect(mockAddToast).toHaveBeenCalledWith(
+          'error',
+          'Failed to destroy hat — Only owners may manage hats',
+        )
       })
     })
   })
