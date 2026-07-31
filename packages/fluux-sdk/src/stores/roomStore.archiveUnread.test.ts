@@ -366,10 +366,11 @@ describe('roomStore.recomputeUnreadForRoom — archive-derived unread (PR B, Tas
   // anchor at t=500, which put the coverage bottom ABOVE the floor — so
   // `isAfterBoundary` deferred the recount before `pointerlessDefers` could
   // matter, and the surviving count proved the coverage gate had fired, not
-  // the guard. Both room `pointerlessDefers` call sites could be deleted with
-  // this test still green. The coverage-gate branch it was really exercising
-  // already has its own unambiguous test ("a resolved coverage bottom sitting
-  // above the floor defers"), so this one is repaired to test what it names:
+  // the guard — both former room `pointerlessDefers` call sites could be deleted
+  // with this test still green. The coverage-gate branch it was really
+  // exercising already has its own unambiguous test ("a resolved coverage
+  // bottom sitting above the floor defers"), so this one is repaired to test
+  // what it names:
   // the bottom (400) now sits BELOW the floor (500), leaving the guard as the
   // ONLY thing that can stand this recount down. Counterpart to chatStore's
   // "NONZERO persisted count still defers via pointerlessDefers".
@@ -390,6 +391,12 @@ describe('roomStore.recomputeUnreadForRoom — archive-derived unread (PR B, Tas
     // derivation before it ever reads the archive, not merely produce a count
     // that happens to match the seed.
     expect(vi.mocked(messageCache.countRoomUnreadInArchive)).not.toHaveBeenCalled()
+    // #1174 + #1214: proves the `pointerless-defer` reason is still emitted,
+    // and still reachable, now that the duplicate guard is gone. (It does NOT
+    // pin the number of call sites: a guard that returns emits once whether
+    // there is one copy or two. What makes the single site matter is that the
+    // reason now has exactly one origin, so a recorded defer is unambiguous.)
+    expect(readRecountDeferrals()['room:pointerless-defer']).toBe(1)
   })
 
   // The reviewer's control (requirement 1, mirrored from Task 7), rewritten
