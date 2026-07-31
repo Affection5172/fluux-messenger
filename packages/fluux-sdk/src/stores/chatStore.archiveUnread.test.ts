@@ -121,7 +121,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     ])
     setMeta({
       unreadCount: 99, // stale — must be overwritten by the exact derivation
-      readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+      readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
     })
     seedCoverage('anchor-stanza')
 
@@ -131,7 +131,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     expect(chatStore.getState().conversations.get(CID)?.unreadCount).toBe(3)
   })
 
-  it('a migrated pointer with no archiveOrderKey over-counts same-millisecond rows rather than reporting zero', async () => {
+  it('a migrated pointer with no tiebreak over-counts same-millisecond rows rather than reporting zero', async () => {
     await messageCache.saveMessages([
       archiveMsg('anchor', 500, { stanzaId: 'anchor-stanza' }),
       archiveMsg('p0', 1000),
@@ -141,7 +141,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     ])
     setMeta({
       unreadCount: 0,
-      // Legacy/migrated shape: no archiveOrderKey at all.
+      // Legacy/migrated shape: no tiebreak at all.
       readPointer: { messageId: 'p0', timestamp: new Date(1000) },
     })
     seedCoverage('anchor-stanza')
@@ -181,6 +181,20 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     await new Promise((resolve) => setTimeout(resolve, 0))
 
     expect(spy).toHaveBeenCalledWith(CID)
+    // Assert the KEY, not just that a recount was scheduled. The fixture above
+    // is a real on-disk blob, so it has to carry the PERSISTED property name
+    // `archiveOrderKey` — the in-memory field is `tiebreak`, and
+    // `deserializeReadPointer` deliberately ignores that never-written name. A
+    // fixture written under the wrong name still restores a pointer, just a
+    // KEYLESS one, so a test that only checks the recount stays green while the
+    // hydrated position silently degrades to the at-or-after-timestamp
+    // fallback. This assertion is what makes that failure loud: the `id` is
+    // reconstructed from `messageId`, so a keyed hydration is only possible
+    // when the fixture used the on-disk name.
+    expect(chatStore.getState().conversationMeta.get(CID)?.readPointer?.tiebreak).toEqual({
+      kind: 'chat',
+      id: 'p0',
+    })
     // Restore the un-wrapped action so later tests aren't left with a spy.
     chatStore.setState({ recomputeUnreadForConversation: original })
   })
@@ -190,7 +204,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
   // ---------------------------------------------------------------------
 
   it('a forward MAM merge into a non-active conversation with new messages triggers a recount', () => {
-    setMeta({ unreadCount: 0, readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } } })
+    setMeta({ unreadCount: 0, readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } } })
     chatStore.setState({ activeConversationId: 'someone-else@example.com' })
     const original = chatStore.getState().recomputeUnreadForConversation
     const spy = vi.fn(original)
@@ -230,7 +244,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
   // ---------------------------------------------------------------------
 
   it('a remote marker advancing a non-active conversation triggers a recount', () => {
-    setMeta({ unreadCount: 0, readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } } })
+    setMeta({ unreadCount: 0, readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } } })
     chatStore.setState({ activeConversationId: 'someone-else@example.com' })
     const original = chatStore.getState().recomputeUnreadForConversation
     const spy = vi.fn(original)
@@ -267,7 +281,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     // tell a real recompute from a no-op.
     setMeta({
       unreadCount: 99,
-      readPointer: { messageId: 'anchor', timestamp: new Date(500), archiveOrderKey: { kind: 'chat', id: 'anchor' } },
+      readPointer: { messageId: 'anchor', timestamp: new Date(500), tiebreak: { kind: 'chat', id: 'anchor' } },
     })
     seedCoverage('anchor-stanza')
     chatStore.setState({ activeConversationId: CID })
@@ -361,7 +375,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
       archiveMsg('u2', 1002),
     ])
     seedCoverage('anchor-stanza')
-    setMeta({ unreadCount: 7, readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } } })
+    setMeta({ unreadCount: 7, readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } } })
 
     await chatStore.getState().recomputeUnreadForConversation(CID)
 
@@ -464,7 +478,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     ])
     setMeta({
       unreadCount: 5, // the persisted/trusted value
-      readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+      readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
     })
     // Coverage IS proven and resolvable — but mamQueryStates is left at its
     // default (NOT caught up to live), so the caught-up gate is the single
@@ -485,7 +499,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     await messageCache.saveMessages([archiveMsg('p0', 1000), archiveMsg('u1', 1001)])
     setMeta({
       unreadCount: 7,
-      readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+      readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
     })
     chatStore.setState((state) => {
       const mamQueryStates = new Map(state.mamQueryStates)
@@ -503,7 +517,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     await messageCache.saveMessages([archiveMsg('p0', 1000), archiveMsg('u1', 1001)])
     setMeta({
       unreadCount: 6,
-      readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+      readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
     })
     // bottomId names an archive stanza-id that was never saved — unresolvable.
     seedCoverage('nonexistent-stanza-id')
@@ -534,7 +548,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     ])
     setMeta({
       unreadCount: 8, // trusted — must survive untouched
-      readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+      readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
     })
     seedCoverage('gap-anchor-stanza')
 
@@ -558,9 +572,9 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
   // unsorted resident array can let that guard make the WRONG forward/no-op
   // decision, landing the stored pointer on the wrong message and skewing the
   // later archive-derived count. 'z-msg' arrives FIRST (wall-clock) but
-  // archive-sorts AFTER 'a-msg' (id tie-break) — arrival order deliberately
-  // disagrees with archive order, the exact case the fix reconciles.
-  it('two same-millisecond live arrivals land in archive order, so the viewport-advance pointer and derived count are both correct', async () => {
+  // cache-sorts AFTER 'a-msg' (id tie-break) — arrival order deliberately
+  // disagrees with cache order, the exact case the fix reconciles.
+  it('two same-millisecond live arrivals land in cache order, so the viewport-advance pointer and derived count are both correct', async () => {
     await messageCache.saveMessages([archiveMsg('anchor', 500, { stanzaId: 'anchor-stanza' })])
     seedCoverage('anchor-stanza')
     chatStore.setState({ activeConversationId: CID })
@@ -573,7 +587,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
 
     // A same-millisecond sibling arrives live, SECOND.
     chatStore.getState().addMessage(archiveMsg('a-msg', T))
-    // The resident array must be in ARCHIVE order (id-ascending), not arrival
+    // The resident array must be in CACHE order (id-ascending), not arrival
     // order — the load-bearing invariant messageTimeline.test.ts pins at the
     // pure-function level; here it is asserted through the real store.
     expect(chatStore.getState().messages.get(CID)?.map((m) => m.id)).toEqual(['a-msg', 'z-msg'])
@@ -614,7 +628,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     await messageCache.saveMessages([archiveMsg('anchor', 500, { stanzaId: 'anchor-stanza' })])
     setMeta({
       unreadCount: 0,
-      readPointer: { messageId: 'anchor', timestamp: new Date(500), archiveOrderKey: { kind: 'chat', id: 'anchor' } },
+      readPointer: { messageId: 'anchor', timestamp: new Date(500), tiebreak: { kind: 'chat', id: 'anchor' } },
     })
     seedCoverage('anchor-stanza')
     // Active + focused (default windowVisible), but viewportAtLiveEdge is
@@ -667,7 +681,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     await messageCache.saveMessages([archiveMsg('anchor', 500, { stanzaId: 'anchor-stanza' }), archiveMsg('p0', 1000)])
     setMeta({
       unreadCount: 0,
-      readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+      readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
     })
     seedCoverage('anchor-stanza')
 
@@ -697,7 +711,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     ])
     setMeta({
       unreadCount: 5,
-      readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+      readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
     })
     seedCoverage('anchor-stanza')
 
@@ -760,7 +774,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     ])
     setMeta({
       unreadCount: 7,
-      readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+      readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
     })
     seedCoverage('anchor-stanza')
 
@@ -803,7 +817,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     ])
     setMeta({
       unreadCount: 5, // stale — the slow recompute below would derive 1 (u1) from THIS pointer
-      readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+      readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
     })
     seedCoverage('anchor-stanza')
     chatStore.setState({ activeConversationId: CID })
@@ -827,7 +841,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
       meta.set(CID, {
         ...meta.get(CID)!,
         unreadCount: 0,
-        readPointer: { messageId: 'u1', timestamp: new Date(1001), archiveOrderKey: { kind: 'chat', id: 'u1' } },
+        readPointer: { messageId: 'u1', timestamp: new Date(1001), tiebreak: { kind: 'chat', id: 'u1' } },
       })
       return { conversationMeta: meta }
     })
@@ -863,7 +877,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     await messageCache.saveMessages([anchor, p0, u1])
     setMeta({
       unreadCount: 99,
-      readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+      readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
     })
     seedCoverage('anchor-stanza')
     // A stale marker left over from before the boundary moved, on the ACTIVE
@@ -897,7 +911,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     await messageCache.saveMessages([anchor, p0, u1])
     setMeta({
       unreadCount: 1,
-      readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+      readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
     })
     seedCoverage('anchor-stanza')
     chatStore.setState({
@@ -933,7 +947,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     await messageCache.saveMessages(resident)
     setMeta({
       unreadCount: 1,
-      readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+      readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
     })
     seedCoverage('anchor-stanza')
     chatStore.setState({ messages: new Map([[CID, resident]]) })
@@ -963,7 +977,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     await messageCache.saveMessages([anchor, p0])
     setMeta({
       unreadCount: 99,
-      readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+      readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
     })
     seedCoverage('anchor-stanza')
     chatStore.setState((state) => {
@@ -1002,7 +1016,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
       setMeta({
         unreadCount: 5,
         mentionsCount: SEEDED_MENTIONS,
-        readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+        readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
       })
       seedCoverage('anchor-stanza')
 
@@ -1026,7 +1040,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
       setMeta({
         unreadCount: 3,
         mentionsCount: SEEDED_MENTIONS,
-        readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+        readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
       })
       seedCoverage('anchor-stanza')
       vi.mocked(messageCache.countUnreadInArchive).mockResolvedValueOnce(null)
@@ -1052,7 +1066,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
     ])
     setMeta({
       unreadCount: 0,
-      readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+      readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
     })
     seedCoverage('anchor-stanza')
     // One never-archived (noLocalStore) message, after the pointer.
@@ -1076,7 +1090,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
       await messageCache.saveMessages([archiveMsg('anchor', 500, { stanzaId: 'anchor-stanza' }), archiveMsg('p0', 1000)])
       setMeta({
         unreadCount: 0,
-        readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+        readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
       })
       seedCoverage('anchor-stanza')
     })
@@ -1177,7 +1191,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
       await messageCache.saveMessages([anchor, m1, m2, m3])
       setMeta({
         unreadCount: 5, // stale — distinct from the correct 0 derived below
-        readPointer: { messageId: 'anchor', timestamp: new Date(500), archiveOrderKey: { kind: 'chat', id: 'anchor' } },
+        readPointer: { messageId: 'anchor', timestamp: new Date(500), tiebreak: { kind: 'chat', id: 'anchor' } },
       })
       seedCoverage('anchor-stanza')
       // Active + focused (default windowVisible), with the full history
@@ -1211,7 +1225,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
       await messageCache.saveMessages([anchor, m1, m2, m3])
       setMeta({
         unreadCount: 5, // stale — distinct from BOTH 0 and the correct 2
-        readPointer: { messageId: 'anchor', timestamp: new Date(500), archiveOrderKey: { kind: 'chat', id: 'anchor' } },
+        readPointer: { messageId: 'anchor', timestamp: new Date(500), tiebreak: { kind: 'chat', id: 'anchor' } },
       })
       seedCoverage('anchor-stanza')
       chatStore.setState({
@@ -1241,7 +1255,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
       // above) while unreadCount is stale.
       setMeta({
         unreadCount: 5, // stale — distinct from the correct 0
-        readPointer: { messageId: 'm1', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'm1' } },
+        readPointer: { messageId: 'm1', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'm1' } },
       })
       seedCoverage('anchor-stanza')
       chatStore.getState().addConversation(createConversation('someone-else@example.com'))
@@ -1281,7 +1295,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
       // here), same as the fully-read sibling test above.
       setMeta({
         unreadCount: 5, // stale — distinct from BOTH 0 (naive force-zero) and the correct 2
-        readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+        readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
       })
       seedCoverage('anchor-stanza')
       chatStore.getState().addConversation(createConversation('someone-else@example.com'))
@@ -1368,7 +1382,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
       ])
       setMeta({
         unreadCount: 3,
-        readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+        readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
       })
       seedCoverage('anchor-stanza')
 
@@ -1391,7 +1405,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
       ])
       setMeta({
         unreadCount: 4,
-        readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+        readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
       })
       seedCoverage('anchor-stanza')
 
@@ -1441,7 +1455,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
       ])
       setMeta({
         unreadCount: 1,
-        readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+        readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
       })
       seedCoverage('anchor-stanza')
 
@@ -1482,7 +1496,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
       // viewport observer has nothing left to advance.
       setMeta({
         unreadCount: 5, // stale — distinct from the correct 0
-        readPointer: { messageId: 'm1', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'm1' } },
+        readPointer: { messageId: 'm1', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'm1' } },
       })
       seedCoverage('anchor-stanza')
       chatStore.setState({ messages: new Map([[CID, [anchor, m1]]]) })
@@ -1512,7 +1526,7 @@ describe('chatStore.recomputeUnreadForConversation — archive-derived unread (P
       await messageCache.saveMessages([anchor, p0, u1, u2])
       setMeta({
         unreadCount: 5, // stale — distinct from BOTH 0 (naive force-zero) and the correct 2
-        readPointer: { messageId: 'p0', timestamp: new Date(1000), archiveOrderKey: { kind: 'chat', id: 'p0' } },
+        readPointer: { messageId: 'p0', timestamp: new Date(1000), tiebreak: { kind: 'chat', id: 'p0' } },
       })
       seedCoverage('anchor-stanza')
       chatStore.setState({ messages: new Map([[CID, [anchor, p0, u1, u2]]]) })

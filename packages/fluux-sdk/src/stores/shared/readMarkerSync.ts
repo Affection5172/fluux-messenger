@@ -9,7 +9,7 @@
 
 import type { NotificationMessage } from './notificationState'
 import * as notifState from './notificationState'
-import { compareOrder, makeArchiveOrderKey } from './readState'
+import { compareOrder, makeCacheOrderKey } from './readState'
 import { makeReadPointer, type ReadPointer } from './readPointer'
 
 /** The notification-relevant slice of a conversation/room metadata entry. */
@@ -63,7 +63,7 @@ export type RemoteDisplayedResolution =
  *   did before PR C (an undefined pointer made the residency check vacuously
  *   true, so `onMessageSeen` took its own no-pointer path); it is preserved
  *   explicitly so it cannot be lost by refactoring.
- * - **Keyed pointer** — decide by archive position, with no residency
+ * - **Keyed pointer** — decide by cache position, with no residency
  *   requirement. The key certifies that the pointer's timestamp is its named
  *   message's own, which is exactly the guarantee the old comment here said we
  *   lacked.
@@ -81,11 +81,11 @@ function resolveAdvance<T extends NotificationMessage & { stanzaId?: string }>(
 ): ReadPointer | 'no-advance' | 'undecidable' {
   if (!current) return makeReadPointer(match, kind)
 
-  if (current.archiveOrderKey) {
+  if (current.tiebreak) {
     const ahead =
       compareOrder(
-        { timestamp: match.timestamp.getTime(), archiveOrderKey: makeArchiveOrderKey(match, kind) },
-        { timestamp: current.timestamp.getTime(), archiveOrderKey: current.archiveOrderKey }
+        { timestamp: match.timestamp.getTime(), tiebreak: makeCacheOrderKey(match, kind) },
+        { timestamp: current.timestamp.getTime(), tiebreak: current.tiebreak }
       ) > 0
     return ahead ? makeReadPointer(match, kind) : 'no-advance'
   }

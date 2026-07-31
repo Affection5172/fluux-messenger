@@ -2506,7 +2506,7 @@ describe('roomStore', () => {
       // roomMeta.readPointer directly mimics a persisted read pointer
       // from a prior session (no live activation has run yet in this test).
       // KEYED, as every persisted pointer is: `makeReadPointer` always writes
-      // the archive order key and `deserializeReadPointer` reads it back.
+      // the cache order key and `deserializeReadPointer` reads it back.
       // Without it the pointer cannot certify its own position, and the message
       // it NAMES sorts after the boundary (a missing key sorts first — see
       // `compareOrder`), so the divider would correctly-but-conservatively land
@@ -2520,7 +2520,7 @@ describe('roomStore', () => {
           readPointer: {
             messageId: 'msg-150',
             timestamp: new Date(150 * 60_000),
-            archiveOrderKey: { kind: 'room', from: `${roomJid}/alice`, id: 'msg-150' },
+            tiebreak: { kind: 'room', from: `${roomJid}/alice`, id: 'msg-150' },
           },
         })
         return { roomMeta: meta }
@@ -6359,7 +6359,7 @@ describe('setActiveRoom new-message marker — delayed history unified with chat
       meta.set(ROOM, {
         ...existing,
         // KEYED, as every pointer `makeReadPointer` writes is — the divider is
-        // derived by archive POSITION now, and a keyless pointer cannot certify
+        // derived by cache POSITION now, and a keyless pointer cannot certify
         // its own (it would land the divider on the seen message itself).
         readPointer: makeReadPointer(seenMsg, 'room'),
       })
@@ -6374,7 +6374,7 @@ describe('setActiveRoom new-message marker — delayed history unified with chat
    * `createMessage`'s default `new Date()` would make the "already read" message
    * the NEWEST in the fixture while sitting first in the array — an ordering the
    * resident array never has in production (PR B gave `messageArrayUtils` the
-   * same `compareOrder` tie-break, so index order and archive order agree).
+   * same `compareOrder` tie-break, so index order and cache order agree).
    */
   const seenMsg = (): RoomMessage =>
     createMessage('seen', ROOM, 'alice', 'seen message', false, new Date('2025-01-15T09:00:00Z'))
@@ -6417,7 +6417,7 @@ describe('setActiveRoom new-message marker — delayed history unified with chat
       [
         seenMsg(),
         // isDelayed defaults to false; timestamped explicitly so the array is
-        // in archive order (see seenMsg above).
+        // in cache order (see seenMsg above).
         createMessage('live', ROOM, 'bob', 'live message', false, new Date('2025-01-15T10:00:00Z')),
       ],
       'seen',

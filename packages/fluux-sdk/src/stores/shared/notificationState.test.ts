@@ -457,7 +457,7 @@ describe('onActivate', () => {
 
   // Residency is no longer a case distinction. There is ONE rule — the divider
   // is the first renderable incoming message strictly after the boundary in
-  // `(timestamp, archiveOrderKey)` order — and it is the same rule whether or
+  // `(timestamp, tiebreak)` order — and it is the same rule whether or
   // not the pointer's own message happens to be in the slice. The old
   // "stale-pointer fallback" ladder these tests were named after is gone; what
   // they now pin is that the one rule keeps giving the right answer when the
@@ -665,7 +665,7 @@ describe('onActivate stale pointer', () => {
   // Replaces 'snaps pointer to the message before the derived divider, not to
   // the newest' — the snap is gone (see the D5 suite's 'never moves the read
   // pointer'). What survives is that an OFF-SLICE pointer still positions a
-  // divider, now purely by archive order.
+  // divider, now purely by cache order.
   it('positions a divider from an off-slice pointer without touching it', () => {
     const mkMsg = (id: string, minutesAgo: number): NotificationMessage => ({
       id, timestamp: new Date(Date.now() - minutesAgo * 60_000), isOutgoing: false, isDelayed: true, body: 'hi',
@@ -1096,7 +1096,7 @@ describe('onMessageSeen — position comparison (PR C, D4)', () => {
     expect(r.readPointer?.messageId).toBe('m2')
   })
 
-  // OFF-SLICE + same millisecond: nothing but the archive order key can decide
+  // OFF-SLICE + same millisecond: nothing but the cache order key can decide
   // this one. The same-ms test above keeps the pointer's OWN message resident,
   // so deleting the keyed branch entirely still answers it correctly by array
   // index; here the index path finds no current position (currentIdx === -1,
@@ -1715,7 +1715,7 @@ describe('readPointer on the remaining pointer-writing transitions (#1081)', () 
     const byId = new Map(messages.map((m) => [m.id, m.timestamp]))
     // Tagged so a failure names the transition that broke the invariant.
     // messageId/timestamp are compared explicitly (not the whole pointer):
-    // archiveOrderKey is not this invariant's concern, and a `kind` constant
+    // tiebreak is not this invariant's concern, and a `kind` constant
     // across every call here would otherwise make it trivially match.
     const coherent = (st: EntityNotificationState, label: string) => {
       const p = st.readPointer
