@@ -72,6 +72,7 @@ const FORMS: Record<string, PluralForms> = {
     many: '{count} nuovi messaggi',
     other: '{count} nuovi messaggi',
   },
+  ko: { other: '새 메시지 {count}개' },
   lt: {
     one: '{count} nauja žinutė',
     few: '{count} naujos žinutės',
@@ -133,6 +134,9 @@ const FORMS: Record<string, PluralForms> = {
   },
   zh: { other: '{count}条新消息' },
 }
+
+/** Normalized base-language codes supported by the runtime notification string table. */
+export const serviceWorkerNotificationBaseLanguages: readonly string[] = Object.freeze(Object.keys(FORMS))
 
 /** Localized "N new messages" for a coalesced notification body. */
 export function newMessagesText(locale: string, count: number): string {
