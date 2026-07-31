@@ -1494,15 +1494,15 @@ describe('countUnreadInArchive (chat)', () => {
     expect(res!.unread).toBe(3)
   })
 
-  it('missing tiebreak falls back to strict-after-timestamp (over-counts, safe)', async () => {
+  it('missing tiebreak falls back to at-or-after-timestamp (over-counts, safe)', async () => {
     const t = new Date(5000)
     await messageCache.saveMessages([
       createMockMessage(CONV, { id: 'm1', timestamp: t, isOutgoing: false }),
       createMockMessage(CONV, { id: 'm2', timestamp: t, isOutgoing: false }),
       createMockMessage(CONV, { id: 'm3', timestamp: new Date(6000), isOutgoing: false }),
     ])
-    // No tiebreak on the pointer (migrated legacy pointer): per compareOrder,
-    // an unresolved key sorts BEFORE any resolved one at an equal timestamp, so BOTH
+    // No tiebreak on the pointer (migrated legacy pointer): per isAfterBoundary,
+    // a keyless boundary means at-or-after its own millisecond, so BOTH
     // m1 (the pointer's own message) and m2 (its same-ms sibling) resolve as "after"
     // the pointer — the read boundary itself gets re-counted rather than a genuinely
     // unread sibling being silently dropped. m3 (a later timestamp) counts regardless.
@@ -1583,7 +1583,7 @@ describe('countRoomUnreadInArchive (room)', () => {
     expect(res).toEqual({ unread: 1 })
   })
 
-  it('missing tiebreak falls back to strict-after-timestamp (over-counts, safe)', async () => {
+  it('missing tiebreak falls back to at-or-after-timestamp (over-counts, safe)', async () => {
     const t = new Date(5000)
     await messageCache.saveRoomMessages([
       createMockRoomMessage(ROOM, { id: 'm1', from: `${ROOM}/alice`, timestamp: t, isOutgoing: false }),

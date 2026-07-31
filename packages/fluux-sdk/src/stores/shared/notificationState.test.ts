@@ -61,7 +61,8 @@ function seen(id: string, timestamp: Date): ReadPointer {
  * KEYED, via `makeReadPointer` — exactly how production builds a pointer for a
  * message it holds. The key is what says "this timestamp is that message's own",
  * and without it the message the pointer NAMES sorts after the floor (a missing
- * key sorts first, see `compareOrder`) and would itself become the divider.
+ * boundary means at-or-after its millisecond, see `isAfterBoundary`) and
+ * would itself become the divider.
  * `seen()` above is the keyless population — a pointer migrated from the
  * pre-#1081 `lastSeenMessageId` + `lastReadAt` pair, which genuinely cannot
  * certify its own position.
@@ -576,8 +577,8 @@ describe('onActivate', () => {
   // count derives from exactly the same fallback (`computeFloor`).
   describe('no read pointer: the boundary is the historyFloor, never unreadCount', () => {
     it('places the divider at the first message after the floor', () => {
-      // The floor shares msg-2's millisecond and msg-2 still counts as after it
-      // (a keyless floor sorts first) — the same rule the count uses.
+      // The floor shares msg-2's millisecond and msg-2 still counts as after it —
+      // `isAfterBoundary` applies the same keyless-boundary rule as the count.
       const state = makeState({ historyFloor: new Date('2025-01-15T09:30:00Z'), unreadCount: 2 })
       const result = onActivate(state, messages, 'chat')
       expect(result.firstNewMessageId).toBe('msg-2')
@@ -698,7 +699,7 @@ describe('onActivate — floor-derived divider (PR C, D5)', () => {
   //
   // Pointer m2@2000 (keyed, absent from the slice); m3@2000 is resident.
   //   before -> ladder finds the first message strictly after 2000 => 'm4'
-  //   PR C   -> compareOrder ranks m3 after m2 at the same ms  => 'm3'
+  //   PR C   -> mayAdvanceTo ranks m3 after m2 at the same ms  => 'm3'
   it('places the divider on a same-millisecond sibling of a NON-RESIDENT pointer', () => {
     const state = { unreadCount: 2, mentionsCount: 0,
       readPointer: makeReadPointer({ id: 'm2', timestamp: new Date(2000) }, 'chat'),
@@ -707,8 +708,8 @@ describe('onActivate — floor-derived divider (PR C, D5)', () => {
     expect(r.firstNewMessageId).toBe('m3')
   })
 
-  // Pointerless: the floor is historyFloor, and a same-ms message counts as
-  // strictly after it (keyless sorts first) — matching the count exactly.
+  // Pointerless: the floor is historyFloor, and `isAfterBoundary` counts a
+  // same-ms message as after that keyless boundary — matching the count exactly.
   it('uses historyFloor when there is no pointer, counting a same-millisecond message as after', () => {
     const state = { unreadCount: 1, mentionsCount: 0, readPointer: undefined,
       historyFloor: new Date(2000), firstNewMessageId: undefined }
@@ -1111,11 +1112,11 @@ describe('onMessageSeen — position comparison (PR C, D4)', () => {
   // NEGATIVE POLARITY — this is the forward-only guard itself. The keyed branch
   // does NOT go through `advance()`: it builds the pointer directly, and both
   // stores commit whatever comes back after only a reference check. So this
-  // `compareOrder(...) > 0` is the SOLE thing standing between a
-  // same-millisecond sibling that sorts BEFORE the pointer and a BACKWARDS
-  // pointer move — which, on a forward-only position, is unrecoverable.
-  // Relaxing the comparison to `>= 0` (or to a key-blind `>=` on timestamps
-  // alone) is caught here and nowhere else.
+  // `mayAdvanceTo(...)` is the SOLE thing standing between a same-millisecond
+  // sibling that sorts BEFORE the pointer and a BACKWARDS pointer move —
+  // which, on a forward-only position, is unrecoverable. Relaxing it to accept
+  // equality (or to a key-blind `>=` on timestamps alone) is caught here and
+  // nowhere else.
   it('does NOT move a KEYED, OFF-SLICE pointer back onto a same-millisecond sibling that sorts before it', () => {
     const state = { unreadCount: 1, mentionsCount: 0,
       readPointer: makeReadPointer({ id: 'm2', timestamp: new Date(1000) }, 'chat'),
