@@ -195,7 +195,7 @@ describe('roomStore.applyRemoteDisplayed', () => {
     expect(after?.readPointer?.identity.messageId).toBe('m2')
   })
 
-  // PR C, D3 widening — at the store layer, where it actually bites. The store
+  // The widening — at the store layer, where it actually bites. The store
   // CHOOSES the array: `mergeRoomMAMMessages` hands `applyRemoteDisplayed` a
   // single trimmed MAM page (`mergedForMarker`, roomStore.ts:3972), and the
   // pointer's own message need not be in it. Before D3 that was undecidable and
@@ -266,7 +266,7 @@ describe('roomStore.applyRemoteDisplayed', () => {
 
   // Inbound read-state sync (spec §4): a marker published by another client
   // advances a backgrounded room's read POSITION immediately (the pointer is
-  // unconditional, forward-only). PR B (Task 8, archive-derived unread) no
+  // unconditional, forward-only). The archive-derived unread recount no
   // longer derives the COUNT from the page-scoped slice this method was
   // handed — that undercounts a multi-page pointer-stitch walk (see the next
   // test's comment) and can never be trusted as "exact". The count is instead
@@ -308,7 +308,7 @@ describe('roomStore.applyRemoteDisplayed', () => {
     expect(room?.mentionsCount).toBe(1)
   })
 
-  // PR B: the count is no longer written synchronously from this page-scoped
+  // The count is no longer written synchronously from this page-scoped
   // slice — it is archive-derived (recomputeUnreadForRoom, fire-and-forget).
   // With no mamQueryStates/roomCoverage seeded, that derivation defers, so the
   // count stays at its seeded stale value (3/1) rather than snapping to this
@@ -359,7 +359,7 @@ describe('roomStore.applyRemoteDisplayed', () => {
   // Multi-page background walk: the pointer resolves against only the FINAL
   // page (mergedForMarker), which undercounts a walk spanning several pages
   // (the fetch-latest page, earlier backward pages) — the badge would read
-  // ~9 instead of the true 19. PR B (Task 8) fixes this architecturally
+  // ~9 instead of the true 19. The archive-derived recount fixes this architecturally
   // rather than by re-reading a wider cache window: the archive-derived
   // recount (recomputeUnreadForRoom) cursors the DURABLE ARCHIVE from the
   // floor forward, so it has no page-boundary undercount to begin with. It
@@ -398,7 +398,7 @@ describe('roomStore.applyRemoteDisplayed', () => {
     roomStore.getState().mergeRoomMAMMessages(ROOM, backwardPage, { first: 's-ptr' }, false, 'backward')
 
     // Pointer resolved at p0 (forward-only sync is unconditional and
-    // unaffected by PR B).
+    // unaffected by the archive-derived count).
     expect(roomStore.getState().roomMeta.get(ROOM)?.readPointer?.identity.messageId).toBe('p0')
 
     // The archive-derived recount runs (fire-and-forget) but defers: no
@@ -436,7 +436,7 @@ describe('roomStore.applyRemoteDisplayed', () => {
       new Promise<RoomMessage[]>((resolve) => { releaseCache = resolve })
     )
     roomStore.getState().mergeRoomMAMMessages(ROOM, page, { first: 's-ptr' }, false, 'backward')
-    // PR B: the pointer resolves synchronously, but the count is no longer
+    // The pointer resolves synchronously, but the count is no longer
     // written synchronously from this page — the archive-derived recount is
     // still pending on the gated cache read below, so the count is untouched.
     expect(roomStore.getState().roomMeta.get(ROOM)?.readPointer?.identity.messageId).toBe('p0')
@@ -975,7 +975,7 @@ describe('roomStore fresh-instance catch-up preserves the remote read position',
     expect(meta?.pendingRemoteDisplayedStanzaId).toBe(undefined)
   })
 
-  // PR B (Task 8): the count is no longer written synchronously from this
+  // The count is no longer written synchronously from this
   // page — it is archive-derived (recomputeUnreadForRoom, triggered
   // fire-and-forget by both the forward-merge and the marker-resolution
   // paths). With no mamQueryStates/roomCoverage seeded, that derivation
@@ -1001,7 +1001,7 @@ describe('roomStore fresh-instance catch-up preserves the remote read position',
     expect(roomStore.getState().roomMeta.get(ROOM)?.unreadCount).toBe(4)
   })
 
-  // Control for the test above, inverted by PR C, D6. It used to assert that
+  // Control for the test above, inverted. It no longer asserts that
   // WITHOUT a pending marker the merge snapped the pointer to 'm10' — proving
   // the marker check was what suppressed the snap. That snap is deleted, so the
   // control now proves the complement, which is the stronger statement: the
@@ -1078,7 +1078,7 @@ describe('roomStore pending-marker guard edges', () => {
   })
 
   // The guard is scoped to the fresh-entity branch — a room that already has a
-  // local pointer must keep its pointer, pending marker or not. PR B: the
+  // local pointer must keep its pointer, pending marker or not. the
   // count is archive-derived (recomputeUnreadForRoom) rather than written
   // synchronously from this page, and defers without proven coverage — see
   // roomStore.archiveUnread.test.ts for the exact-outcome path.
@@ -1104,7 +1104,7 @@ describe('roomStore pending-marker guard edges', () => {
     expect(roomStore.getState().roomMeta.get(ROOM)?.unreadCount).toBe(6)
   })
 
-  // PR B: the count is archive-derived rather than written synchronously from
+  // The count is archive-derived rather than written synchronously from
   // this page; it defers without proven coverage. The exact-outcome
   // equivalent (real coverage + archive rows, proving mentions are counted
   // from the resolved marker rather than the start of the page) lives in

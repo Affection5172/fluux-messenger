@@ -86,7 +86,7 @@ describe('chatStore', () => {
     // Reset store state before each test
     localStorageMock.clear()
     chatStore.setState({
-      // Reset separated maps (Phase 6)
+      // Reset separated maps
       conversationEntities: new Map(),
       conversationMeta: new Map(),
       // Reset combined map
@@ -117,16 +117,16 @@ describe('chatStore', () => {
     // against it leaking noted entries across `it()` blocks (roomStore's twin
     // suite hit exactly this with fixed message ids reused across tests).
     _clearAllTransientForTesting()
-    // Task 11: viewport evidence is ALSO a module-level Map outside any store —
+    // Viewport evidence is ALSO a module-level Map outside any store —
     // same leakage risk across `it()` blocks reusing the same conversation id.
     _clearAllViewportEvidenceForTesting()
   })
 
   /**
-   * Task 11: simulate the view reporting "genuinely at the live edge" for the
+   * Simulate the view reporting "genuinely at the live edge" for the
    * CURRENT activation generation — mirrors what `ChatView`'s `reportLiveEdge`
    * callback does in the real app after `setActiveConversation` runs. Tests
-   * that pre-date Task 11 assumed `isActive && windowVisible` alone meant
+   * that predate viewport evidence assumed `isActive && windowVisible` alone meant
    * "seen"; they now need this explicit report to keep that behavior, exactly
    * as a real conversation genuinely parked at the bottom would produce it.
    */
@@ -200,7 +200,7 @@ describe('chatStore', () => {
     // When a later deferred-decrypt reveals it was a signal and drops it, the
     // unread badge must drop too.
     //
-    // PR B (archive-derived unread): this method no longer recomputes from a
+    // This method no longer recomputes from a
     // resident-window/cache SLICE — it derives the count from the durable
     // archive, gated on proven MAM coverage down to the read floor (see
     // chatStore.archiveUnread.test.ts for the full derivation matrix:
@@ -208,7 +208,7 @@ describe('chatStore', () => {
     // preservation). Neither test below seeds `mamQueryStates`/
     // `conversationCoverage`, so the entity is NOT proven caught-up — the
     // derivation correctly DEFERS and the stale count survives untouched.
-    // That is deliberate: it demonstrates requirement 1 (discard the legacy
+    // That is deliberate: it demonstrates discarding the legacy
     // count — deferred means "leave the last TRUSTED value alone", not "leave
     // the last provisional slice-scan result alone") using this exact
     // regression scenario.
@@ -253,7 +253,7 @@ describe('chatStore', () => {
 
     it('defers (leaves the stale count untouched) when the conversation is not resident and coverage is not proven', async () => {
       const read = withId(createMessage(cid, 'read'), 'm-read', '2026-06-10T00:00:00Z')
-      // No `getMessages` seed: since PR C, D6 deleted the pointer-writing guard
+      // No `getMessages` seed: the pointer-writing guard is gone, so
       // pass, this derivation never reads the cache window at all — it goes
       // straight to the coverage gate. A `mockResolvedValueOnce` here would now
       // survive unconsumed and leak into the next test that calls getMessages.
@@ -965,7 +965,7 @@ describe('chatStore', () => {
       expect(chatStore.getState().activeConversationId).toBeNull()
     })
 
-    // Read-state PR B, final whole-branch-review FIX 2: this used to protect
+    // This used to protect
     // "activating a conversation force-zeroes unreadCount". That behaviour is
     // removed — the canonical count is derived exclusively from the archive
     // (recomputeUnreadForConversation) and converges to 0 only through Task
@@ -985,7 +985,7 @@ describe('chatStore', () => {
 
   // The divider is the first message the canonical count would count, derived
   // from the read BOUNDARY (`computeFloor`) rather than from a resident-slice
-  // ladder (read-state PR C, D5). These two controls cover the chat store's two
+  // ladder. These two controls cover the chat store's two
   // plumbed `historyFloor` sites; both use a POINTERLESS conversation, because
   // `computeFloor` is pointer-wins and a pointer would make the break inert.
   describe('floor-derived divider plumbing (PR C, D5)', () => {
@@ -1315,7 +1315,7 @@ describe('chatStore', () => {
       expect(conv?.unreadCount).toBe(0)
     })
 
-    // PR C, D1 — the negative control the store layer was missing entirely.
+    // The negative control the store layer was missing entirely.
     // `isOutgoing` is true for a CARBON of a message we sent from another
     // device, and before D1 `onMessageReceived` returned early for any outgoing
     // message: it zeroed the count and dragged the forward-only read pointer
@@ -1379,7 +1379,7 @@ describe('chatStore', () => {
     it('should not increment unreadCount when conversation is active AND at the live edge', () => {
       chatStore.getState().addConversation(createConversation('alice@example.com'))
       chatStore.getState().setActiveConversation('alice@example.com')
-      // Task 11: "active" alone is no longer sufficient — the view must also have
+      // "active" alone is no longer sufficient — the view must also have
       // reported the viewport as genuinely at the live edge for THIS activation.
       reportAtLiveEdge('alice@example.com')
 
@@ -1983,7 +1983,7 @@ describe('chatStore', () => {
         timestamp: messageTimestamp,
         isOutgoing: false,
       })
-      // Task 11: the pointer advance now also requires viewport evidence that the
+      // The pointer advance now also requires viewport evidence that the
       // reader is genuinely at the live edge. Activate through the REAL store action
       // (sole caller of beginViewportGeneration) so the report lands on the current
       // generation — a raw setState would leave it stale and silently ignored.
@@ -2034,7 +2034,7 @@ describe('chatStore', () => {
         isOutgoing: false,
       })
 
-      // Task 11: viewport evidence for the CURRENT activation generation is now a
+      // Viewport evidence for the CURRENT activation generation is now a
       // precondition of the advance (see the fixture note above).
       chatStore.getState().setActiveConversation('alice@example.com')
       reportAtLiveEdge('alice@example.com')
@@ -2064,7 +2064,7 @@ describe('chatStore', () => {
         isOutgoing: false,
       })
 
-      // Task 11: viewport evidence for the CURRENT activation generation is now a
+      // Viewport evidence for the CURRENT activation generation is now a
       // precondition of the advance (see the fixture note above).
       chatStore.getState().setActiveConversation('alice@example.com')
       reportAtLiveEdge('alice@example.com')
@@ -3014,7 +3014,7 @@ describe('chatStore', () => {
       chatStore.getState().addConversation(createConversation('alice@example.com'))
       chatStore.getState().addConversation(createConversation('bob@example.com'))
 
-      // View Alice's conversation, genuinely at the live edge (Task 11).
+      // View Alice's conversation, genuinely at the live edge.
       chatStore.getState().setActiveConversation('alice@example.com')
       reportAtLiveEdge('alice@example.com')
 
@@ -3887,7 +3887,7 @@ describe('chatStore', () => {
       chatStore.setState({ activeConversationId: 'other@example.com' })
     })
 
-    // PR B: a forward merge into a non-active conversation no longer writes a
+    // A forward merge into a non-active conversation no longer writes a
     // page-scoped count synchronously — it schedules recomputeUnreadForConversation
     // (fire-and-forget), which derives the badge from the durable archive instead
     // (see chatStore.archiveUnread.test.ts for the exact-outcome path). With no
@@ -3957,7 +3957,7 @@ describe('chatStore', () => {
       expect(conv?.unreadCount).toBe(5)
     })
 
-    // Was 'snaps the pointer (fresh-join guard)'. PR C, D6 deleted that snap:
+    // Was 'snaps the pointer (fresh-join guard)'. That snap is gone:
     // a merge inferring "you have read everything I just downloaded" writes the
     // forward-only pointer past history the user never saw, and there is no way
     // back. A pointerless conversation now counts from its `historyFloor`
@@ -5115,7 +5115,7 @@ describe('chatStore parity drift regressions', () => {
  * deferred poll-closed verification): a live-path message carrying an older
  * timestamp.
  *
- * `appendLive` sorts the whole resident array (FIX 5, #1155), so a delayed
+ * `appendLive` sorts the whole resident array (#1155), so a delayed
  * arrival is placed in timestamp order rather than at the live edge — and when
  * it is older than the window's oldest resident message and the window is
  * already at its bound, keep-newest drops it again in the same call. The pure

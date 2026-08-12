@@ -63,7 +63,7 @@ vi.mock('../utils/messageCache', async (importOriginal) => {
 import * as messageCache from '../utils/messageCache'
 
 /**
- * Task 11: simulate the view reporting "genuinely at the live edge" for the
+ * Simulate the view reporting "genuinely at the live edge" for the
  * CURRENT activation generation — mirrors what `RoomView`'s `reportLiveEdge`
  * callback does in the real app after `setActiveRoom` runs. Requires the REAL
  * `setActiveRoom` to have run first (it is the sole caller of
@@ -110,7 +110,7 @@ describe('roomStore', () => {
     // fixtures below reuse the same room jid + message id across `it()`
     // blocks, which would otherwise resolve to an already-noted entry.
     _clearAllTransientForTesting()
-    // Task 11: viewport evidence is ALSO a module-level Map outside any store —
+    // Viewport evidence is ALSO a module-level Map outside any store —
     // same leakage risk across `it()` blocks reusing the same room jid.
     _clearAllViewportEvidenceForTesting()
   })
@@ -1064,7 +1064,7 @@ describe('roomStore', () => {
 
     it('should not increment unread count for active room AND at the live edge', () => {
       roomStore.getState().addRoom(createRoom('test@conference.example.com'))
-      // Task 11: use the REAL setActiveRoom (not a raw activeRoomJid setState) so it
+      // Use the REAL setActiveRoom (not a raw activeRoomJid setState) so it
       // actually begins a viewport-evidence generation, then report the live edge for it.
       roomStore.getState().setActiveRoom('test@conference.example.com')
       reportAtLiveEdge('test@conference.example.com')
@@ -1097,7 +1097,7 @@ describe('roomStore', () => {
       expect(roomStore.getState().rooms.get('test@conference.example.com')?.unreadCount).toBe(0)
     })
 
-    // PR C, D1: the outgoing early return is gone — an outgoing message only
+    // The outgoing early return is gone — an outgoing message only
     // clears unread state via `userSeesMessage`, same as any visible message.
     // "Sending a message" only means something as evidence of reading when the
     // room is genuinely active AND at the live edge, so the fixture must drive
@@ -1163,7 +1163,7 @@ describe('roomStore', () => {
       roomStore.getState().addRoom(createRoom('test@conference.example.com', {
         unreadCount: 7,
       }))
-      // PR C, D1: only reaches `userSeesMessage` — and so only advances the
+      // Only reaches `userSeesMessage` — and so only advances the
       // pointer/clears the count — once the room is genuinely active at the
       // live edge (real activation path, not raw `setState`).
       roomStore.getState().setActiveRoom('test@conference.example.com')
@@ -1180,7 +1180,7 @@ describe('roomStore', () => {
       expect(meta?.readPointer?.identity.messageId).toBe('msg-outgoing')
     })
 
-    // PR C, D1 — the NEGATIVE control for the two tests above, and the vector
+    // The NEGATIVE control for the two tests above, and the vector
     // #1081 exists to close. `isOutgoing` in a MUC is attributed by NICK, so a
     // reflection of somebody else's message (or of our own message sent from
     // another device) can arrive flagged outgoing at a room the user is not
@@ -1863,7 +1863,7 @@ describe('roomStore', () => {
         ...createMessage('msg1', 'test@conference.example.com', 'alice', 'Hello'),
         timestamp: msgTimestamp,
       })
-      // Task 11: the pointer advance now also requires viewport evidence that the
+      // The pointer advance now also requires viewport evidence that the
       // reader is genuinely at the live edge. Activate through the REAL store action
       // (sole caller of beginViewportGeneration) so the report lands on the current
       // generation — a raw setState would leave it stale and silently ignored.
@@ -1908,7 +1908,7 @@ describe('roomStore', () => {
         timestamp: msgTimestamp,
       })
 
-      // Task 11: viewport evidence for the CURRENT activation generation is now a
+      // Viewport evidence for the CURRENT activation generation is now a
       // precondition of the advance (see the fixture note above).
       roomStore.getState().setActiveRoom('test@conference.example.com')
       reportAtLiveEdge('test@conference.example.com')
@@ -1933,7 +1933,7 @@ describe('roomStore', () => {
         timestamp: msgTimestamp,
       })
 
-      // Task 11: viewport evidence for the CURRENT activation generation is now a
+      // Viewport evidence for the CURRENT activation generation is now a
       // precondition of the advance (see the fixture note above).
       roomStore.getState().setActiveRoom('test@conference.example.com')
       reportAtLiveEdge('test@conference.example.com')
@@ -2097,7 +2097,7 @@ describe('roomStore', () => {
 
     it('should not increment mentions count for active room AND at the live edge', () => {
       roomStore.getState().addRoom(createRoom('test@conference.example.com'))
-      // Task 11: use the REAL setActiveRoom so a viewport-evidence generation
+      // Use the REAL setActiveRoom so a viewport-evidence generation
       // actually begins, then report the live edge for it.
       roomStore.getState().setActiveRoom('test@conference.example.com')
       reportAtLiveEdge('test@conference.example.com')
@@ -2299,10 +2299,10 @@ describe('roomStore', () => {
       expect(roomStore.getState().activeRoomJid).toBe('test@conference.example.com')
     })
 
-    // Read-state PR B, final whole-branch-review FIX 2: this used to protect
+    // This used to protect
     // "activating a room force-zeroes unreadCount". That behaviour is removed —
     // the canonical count is derived exclusively from the archive
-    // (recomputeUnreadForRoom) and converges to 0 only through Task 11's
+    // (recomputeUnreadForRoom) and converges to 0 only through the
     // live-edge convergence, never as a side effect of merely opening the room.
     // This test now protects the opposite: setActiveRoom must leave the count
     // untouched.
@@ -2323,7 +2323,7 @@ describe('roomStore', () => {
     })
   })
 
-  // Twin of chatStore's "floor-derived divider plumbing" suite (read-state PR C,
+  // Twin of chatStore's "floor-derived divider plumbing" suite
   // D5). Both controls use a POINTERLESS room, because `computeFloor` is
   // pointer-wins and a pointer would make the deliberate break inert.
   describe('floor-derived divider plumbing (PR C, D5)', () => {
@@ -4106,7 +4106,7 @@ describe('roomStore', () => {
       roomStore.getState().addRoom(createRoom('room1@conference.example.com'))
       roomStore.getState().addRoom(createRoom('room2@conference.example.com'))
 
-      // View Room 1, genuinely at the live edge (Task 11).
+      // View Room 1, genuinely at the live edge.
       roomStore.getState().setActiveRoom('room1@conference.example.com')
       reportAtLiveEdge('room1@conference.example.com')
 
@@ -4593,7 +4593,7 @@ describe('roomStore', () => {
       roomStore.setState({ activeRoomJid: 'other@conference.example.com' })
     })
 
-    // PR B (Task 8): a forward merge into a non-active room no longer writes a
+    // A forward merge into a non-active room no longer writes a
     // page-scoped count synchronously — it schedules recomputeUnreadForRoom
     // (fire-and-forget), which derives the badge from the durable archive
     // instead (see roomStore.archiveUnread.test.ts for the exact-outcome
@@ -4667,7 +4667,7 @@ describe('roomStore', () => {
       expect(room?.mentionsCount).toBe(2)
     })
 
-    // Was 'snaps the pointer (fresh-join guard)'. PR C, D6 deleted that snap:
+    // Was 'snaps the pointer (fresh-join guard)'. That snap is gone:
     // a merge inferring "you have read everything I just downloaded" writes the
     // forward-only pointer past history the user never saw, and there is no way
     // back. A pointerless room now counts from its `historyFloor` creation
@@ -6326,7 +6326,7 @@ describe('setActiveRoom new-message marker — delayed history unified with chat
     // fixtures below reuse the same room jid + message id across `it()`
     // blocks, which would otherwise resolve to an already-noted entry.
     _clearAllTransientForTesting()
-    // Task 11: viewport evidence is ALSO a module-level Map outside any store —
+    // Viewport evidence is ALSO a module-level Map outside any store —
     // same leakage risk across `it()` blocks reusing the same room jid.
     _clearAllViewportEvidenceForTesting()
   })
@@ -6368,7 +6368,7 @@ describe('setActiveRoom new-message marker — delayed history unified with chat
    * The read message, timestamped EXPLICITLY and before the history below.
    * `createMessage`'s default `new Date()` would make the "already read" message
    * the NEWEST in the fixture while sitting first in the array — an ordering the
-   * resident array never has in production (PR B gave `messageArrayUtils` the
+   * resident array never has in production (`messageArrayUtils` uses the
    * same `compareExact` tie-break, so index order and cache order agree).
    */
   const seenMsg = (): RoomMessage =>
@@ -6377,7 +6377,7 @@ describe('setActiveRoom new-message marker — delayed history unified with chat
   it('places the divider on delayed history after lastSeen (unified with chats)', () => {
     // Rooms treat delayed (MAM/history-replay) messages exactly as chats do:
     // `isDelayed` plays no part at all, only the position relative to the
-    // read boundary (PR C, D8).
+    // read boundary.
     const marker = activateWith(
       [
         seenMsg(),
@@ -6394,7 +6394,7 @@ describe('setActiveRoom new-message marker — delayed history unified with chat
     // Same setup WITHOUT seeding a readPointer or unreadCount. `addRoom` stamps
     // the join watermark at "now", and the replayed history predates it, so
     // nothing sits after the boundary — that watermark, not `isDelayed`, is
-    // what keeps a fresh join marker-free (PR C, D5/D8).
+    // what keeps a fresh join marker-free.
     roomStore.getState().addRoom(createRoom(ROOM, {
       joined: true,
       messages: [

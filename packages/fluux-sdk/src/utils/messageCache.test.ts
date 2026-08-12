@@ -1212,7 +1212,7 @@ describe('v4 migration — identity-resolving canonicalization (streaming)', () 
     expect(mine[0].timestamp.getTime()).toBe(2000)
     expect(await messageCache.getRoomMessage(ROOM, 'client-1')).not.toBeNull()
     expect(await messageCache.getRoomMessage(ROOM, 'server-9')).not.toBeNull()
-    // Task 4 room-scoped getRoomMessageByStanzaId(roomJid, stanzaId): the merged row
+    // Room-scoped getRoomMessageByStanzaId(roomJid, stanzaId): the merged row
     // stays resolvable by its stanzaId within its own room.
     expect(await messageCache.getRoomMessageByStanzaId(ROOM, 'S')).not.toBeNull()
   })
@@ -1416,7 +1416,7 @@ describe('live paths — identity-resolving upsert + alias lookups + mutations',
 })
 
 // =============================================================================
-// Task 4: archive count primitive (countUnreadInArchive / countRoomUnreadInArchive)
+// Archive count primitive (countUnreadInArchive / countRoomUnreadInArchive)
 // =============================================================================
 
 describe('countUnreadInArchive (chat)', () => {

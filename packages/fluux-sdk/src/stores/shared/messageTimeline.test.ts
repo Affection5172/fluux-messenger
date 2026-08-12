@@ -76,7 +76,7 @@ describe('messageTimeline', () => {
       }
     })
 
-    // FIX 5 (read-state PR B, final whole-branch review): appendLive used to
+    // appendLive used to
     // append in ARRIVAL order (`[...messages, incoming]`, never sorted), while
     // the archive orders same-millisecond rows by the shared comparator (chat:
     // id). Since the viewport observer advances the read pointer by RESIDENT
@@ -119,7 +119,7 @@ describe('messageTimeline', () => {
     //
     // A "delayed" arrival reaches appendLive on the LIVE path but carries an
     // older timestamp: offline replay, gateway/MUC history, the MAM `{ids}`
-    // fetch behind deferred poll-closed verification. FIX 5's sort is a total
+    // fetch behind deferred poll-closed verification. appendLive's sort is a total
     // order over the whole resident array, so it does not distinguish these
     // from same-millisecond siblings — it repositions them too. The two tests
     // below pin that consequence, which no test covered before.
