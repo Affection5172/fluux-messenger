@@ -37,7 +37,7 @@ export function createMockClient() {
   const sdkHandlers = new Map<string, Set<(payload: unknown) => void>>()
 
   const client = {
-    chat: {
+    messages: {
       queryMAM: vi.fn().mockResolvedValue(undefined),
       queryRoomMAM: vi.fn().mockResolvedValue(undefined),
     },
@@ -52,10 +52,10 @@ export function createMockClient() {
         discoverNewConversationsFromRoster: vi.fn().mockResolvedValue(undefined),
       },
     },
-    muc: {
+    rooms: {
       queryRoomMembers: vi.fn().mockResolvedValue([]),
     },
-    discovery: {
+    server: {
       discoverMAMSearchCapability: vi.fn().mockResolvedValue(undefined),
     },
     isConnected: vi.fn().mockReturnValue(true),

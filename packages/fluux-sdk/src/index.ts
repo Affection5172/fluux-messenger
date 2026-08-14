@@ -55,7 +55,7 @@
  * // no React and no extra setup needed.
  * const client = new XMPPClient()
  * await client.connect({ jid: 'bot@example.com', password: 'secret', server: 'example.com' })
- * client.chat.sendMessage('user@example.com', 'Hello!')
+ * client.messages.sendMessage('user@example.com', 'Hello!')
  * ```
  *
  * @packageDocumentation
@@ -601,7 +601,7 @@ export type { XMPPStanzaError, XMPPErrorType } from './utils/xmppError'
 export { classifyConnectionError, extractTransportErrorClass, humanizeTransportError } from './core/modules/transportErrors'
 export type { ConnectionErrorKind } from './core/modules/transportErrors'
 
-// MUC join failure error (rejected by client.muc.joinResult)
+// MUC join failure error (rejected by client.rooms.joinResult)
 export { RoomJoinError, WhisperCounterpartGoneError, HatCommandError, IQTimeoutError } from './core/errors'
 
 // XEP-0045: MUC Permission Utilities
