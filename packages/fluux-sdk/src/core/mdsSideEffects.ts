@@ -58,8 +58,9 @@ import {
   type ExactPosition,
   type PointerOrder,
 } from '../stores/shared/readState'
-import type { ReadPointer } from '../stores/shared/readPointer'
+import { makeReadPointer, type ReadPointer } from '../stores/shared/readPointer'
 import { getBareJid } from './jid'
+import { beginLocallyPublishedDisplayed } from './localMdsPublishes'
 import { logInfo } from './logger'
 import * as messageCache from '../utils/messageCache'
 import { getStorageScopeJid } from '../utils/storageScope'
@@ -88,6 +89,10 @@ const PUBLISH_DEBOUNCE_MS = 1_500
  */
 const CACHE_LOOKBACK = 50
 
+function isDefinitivePublishRejection(error: unknown): boolean {
+  return (error as { name?: unknown } | null)?.name === 'StanzaError'
+}
+
 /**
  * Sets up the MDS read-position publisher side effect.
  *
@@ -105,8 +110,9 @@ export function setupMdsSideEffects(
   // Publishing is disabled until the fresh-session seed completes, so the seed
   // itself is never re-published.
   let syncEnabled = false
-  // Dirty per-JID buffer (jid → stanzaId), latest-wins.
-  const dirty = createKeyedCoalescer<string, string>()
+  // Dirty per-JID buffer (jid → exact publish position), latest-wins.
+  type ResolvedPublish = { stanzaId: string; readPointer: ReadPointer }
+  const dirty = createKeyedCoalescer<string, ResolvedPublish>()
   // Highest stanza-id we believe is on the node per JID (seed + our publishes).
   const lastKnownNodeStanzaId = new Map<string, string>()
   const lastKnownNodeRevision = new Map<string, number>()
@@ -132,6 +138,7 @@ export function setupMdsSideEffects(
   // the JIDs owed another pass because they changed during one. See consider().
   const resolutionInFlight = new Set<string>()
   const resolutionOwed = new Set<string>()
+  const pendingLegacyMigrations = new Map<string, string>()
   // Bumped whenever the session boundary moves (fresh seed, disconnect). A
   // resolution that spans a bump was ordered against node state the new session
   // has re-derived, so it is discarded rather than published.
@@ -157,10 +164,7 @@ export function setupMdsSideEffects(
     return jid ? getBareJid(jid) : ''
   }
 
-  /**
-   * XEP-0359 `by` for a conversation's stanza-ids: the archive that assigned
-   * them — the room itself for MUC, our own server (bare JID) for 1:1.
-   */
+
   function stanzaIdBy(jid: string): string {
     return isRoom(jid) ? jid : ownBareJid()
   }
@@ -173,9 +177,21 @@ export function setupMdsSideEffects(
   function migrateLegacyMarker(jid: string, stanzaId: string): void {
     const by = stanzaIdBy(jid)
     if (!by) return
-    client.internal.mds.publishDisplayed(jid, stanzaId, by).catch(() => {
+    pendingLegacyMigrations.delete(jid)
+    // No publish claim here. Migration rewrites the PAYLOAD of a marker another client wrote; the
+    // position it carries is that client's reading, not ours. Claiming it would make this client
+    // suppress the very marker it just republished, and the divider would ignore a position it
+    // should follow.
+    void client.internal.mds.publishDisplayed(jid, stanzaId, by).catch(() => {
       // Best-effort — an unconverted marker is republished on the next advance.
     })
+  }
+
+  function retryLegacyMigrations(): void {
+    if (disposed || !syncEnabled || connectionStore.getState().status !== 'online') return
+    for (const [jid, stanzaId] of pendingLegacyMigrations) {
+      migrateLegacyMarker(jid, stanzaId)
+    }
   }
 
   /** Index of a stanza-id in a conversation's/room's loaded messages, or -1. */
@@ -277,8 +293,8 @@ export function setupMdsSideEffects(
   function newestResolvableAtOrBehind(
     messages: Array<{ stanzaId?: string; from?: string; id: string; timestamp: Date }>,
     boundary: PointerOrder
-  ): string | undefined {
-    let best: { pos: ExactPosition; stanzaId: string } | undefined
+  ): ResolvedPublish | undefined {
+    let best: { pos: ExactPosition; publish: ResolvedPublish } | undefined
     for (const m of messages) {
       if (!m.stanzaId) continue
       const pos = exactPosition(m, 'chat')
@@ -287,9 +303,14 @@ export function setupMdsSideEffects(
       // than publish past it — the under-advance this module prefers (#1173).
       if (isAfterBoundary(pos, boundary)) continue // ahead of the pointer — never publish
       // Picking the newest candidate: both sides are exact by construction.
-      if (!best || compareExact(pos, best.pos) > 0) best = { pos, stanzaId: m.stanzaId }
+      if (!best || compareExact(pos, best.pos) > 0) {
+        best = {
+          pos,
+          publish: { stanzaId: m.stanzaId, readPointer: makeReadPointer(m, 'chat') },
+        }
+      }
     }
-    return best?.stanzaId
+    return best?.publish
   }
 
   function readPointer(jid: string): ReadPointer | undefined {
@@ -342,7 +363,7 @@ export function setupMdsSideEffects(
    * Resolve a LOCAL pointer's stanza-id from resident state.
    *
    * Only reached for `identity.state === 'local'`: an `addressable` pointer
-   * needs no resolution at all (see {@link resolveSeenStanzaId}), so everything
+   * needs no resolution at all (see {@link resolveSeenPosition}), so everything
    * below is the degraded path and nothing else.
    *
    * The two branches differ deliberately. A MUC reflects our own message back
@@ -354,27 +375,35 @@ export function setupMdsSideEffects(
    * stanza-ids at all would have nothing resolvable at or behind the pointer for
    * a fallback to find. So the asymmetry is the point, not an omission.
    */
-  function resolveFromStores(jid: string, pointer: ReadPointer): string | undefined {
+  function resolveFromStores(jid: string, pointer: ReadPointer): ResolvedPublish | undefined {
     if (isRoom(jid)) {
       const target = exactRoomPointerTarget(pointer)
       if (!target) return undefined
       const { messageId: seenId, from } = target
       const messages = roomStore.getState().messages.get(jid) ?? []
-      const fromSlice = messages.find((m) => m.id === seenId && m.from === from)?.stanzaId
-      if (fromSlice) return fromSlice
+      const fromSlice = messages.find((m) => m.id === seenId && m.from === from)
+      if (fromSlice?.stanzaId) {
+        return { stanzaId: fromSlice.stanzaId, readPointer: makeReadPointer(fromSlice, 'room') }
+      }
       // Non-active rooms keep no resident array (memory windowing); mark-all-read
       // points at the newest known message, whose stanza-id survives on the
       // lastMessage preview.
       const last = conversationLastMessage(jid)
-      return last?.id === seenId && last.from === from ? last.stanzaId : undefined
+      return last?.id === seenId && last.from === from && last.stanzaId
+        ? { stanzaId: last.stanzaId, readPointer: makeReadPointer(last, 'room') }
+        : undefined
     }
     const seenId = pointer.identity.messageId
     const messages = chatStore.getState().messages.get(jid) || []
-    const fromSlice = messages.find((m) => m.id === seenId)?.stanzaId
-    if (fromSlice) return fromSlice
+    const fromSlice = messages.find((m) => m.id === seenId)
+    if (fromSlice?.stanzaId) {
+      return { stanzaId: fromSlice.stanzaId, readPointer: makeReadPointer(fromSlice, 'chat') }
+    }
     // Same eviction fallback for backgrounded 1:1 conversations.
     const last = conversationLastMessage(jid)
-    if (last?.id === seenId && last.stanzaId) return last.stanzaId
+    if (last?.id === seenId && last.stanzaId) {
+      return { stanzaId: last.stanzaId, readPointer: makeReadPointer(last, 'chat') }
+    }
     // The pointer names a message with no stanza-id — in 1:1 the normal resting
     // state once the user has replied. Publish the newest position we CAN
     // address at or behind it rather than staying silent for the session.
@@ -404,13 +433,15 @@ export function setupMdsSideEffects(
    * Rooms keep the exact-position contract and get NO at-or-behind fallback, in
    * the cache as in memory — see {@link resolveFromStores} for why.
    */
-  async function resolveFromCache(jid: string, pointer: ReadPointer): Promise<string | undefined> {
+  async function resolveFromCache(jid: string, pointer: ReadPointer): Promise<ResolvedPublish | undefined> {
     if (!messageCache.isMessageCacheAvailable()) return undefined
     if (isRoom(jid)) {
       const target = exactRoomPointerTarget(pointer)
       if (!target) return undefined
       const cached = await messageCache.getRoomMessage(jid, target.messageId, target.from)
       return cached?.stanzaId
+        ? { stanzaId: cached.stanzaId, readPointer: makeReadPointer(cached, 'room') }
+        : undefined
     }
     // `before` is an exclusive upper bound, so probe one millisecond past the
     // pointer to include the message sitting exactly on it; it also forces the
@@ -459,12 +490,14 @@ export function setupMdsSideEffects(
    * for. The function therefore stays `async` and every caller keeps
    * revalidating after the await.
    */
-  async function resolveSeenStanzaId(jid: string): Promise<string | undefined> {
+  async function resolveSeenPosition(jid: string): Promise<ResolvedPublish | undefined> {
     const pointer = readPointer(jid)
     if (!pointer) return undefined
     // The wire name we already hold. No lookup can improve on it: it came from
     // the message this position names, bound by identity at mint time.
-    if (pointer.identity.state === 'addressable') return pointer.identity.archiveId
+    if (pointer.identity.state === 'addressable') {
+      return { stanzaId: pointer.identity.archiveId, readPointer: pointer }
+    }
     return resolveFromStores(jid, pointer) ?? (await resolveFromCache(jid, pointer))
   }
 
@@ -493,7 +526,8 @@ export function setupMdsSideEffects(
     // Reopen the window immediately so advances during the awaits below buffer.
     dirty.open()
 
-    for (const { key: jid, value: stanzaId } of entries) {
+    for (const { key: jid, value: publish } of entries) {
+      const { stanzaId, readPointer } = publish
       // Skip when the node already holds exactly this stanza-id: it is the echo
       // of a remote notify (recorded by the read:displayed-synced subscription
       // below) or a redundant re-enqueue. The local marker is forward-only, so
@@ -526,11 +560,14 @@ export function setupMdsSideEffects(
         continue
       }
       if (decision === 'skip') continue
+      const accountJid = ownBareJid()
+      const claim = beginLocallyPublishedDisplayed(accountJid, jid, readPointer)
       try {
         await client.internal.mds.publishDisplayed(jid, stanzaId, by)
+        claim.settle('published')
         recordKnownNodeStanzaId(jid, stanzaId)
-      } catch {
-        // Best-effort; keep the position handled as documented above.
+      } catch (error) {
+        claim.settle(isDefinitivePublishRejection(error) ? 'rejected' : 'ambiguous')
       }
     }
   }
@@ -602,7 +639,7 @@ export function setupMdsSideEffects(
     const owner = ownBareJid()
     const wasRoom = isRoom(jid)
 
-    const stanzaId = await resolveSeenStanzaId(jid)
+    const publish = await resolveSeenPosition(jid)
 
     // Teardown, or a session that ended or restarted (a new seed re-derives the
     // node state this result was ordered against).
@@ -627,7 +664,8 @@ export function setupMdsSideEffects(
     // later call short-circuit on the equality check above, and the position
     // would never be enqueued nor reach the node (#1142). The key means "this
     // position is handled", not "we have seen it".
-    if (!stanzaId) return
+    if (!publish) return
+    const { stanzaId } = publish
 
     // No regressive publish: only publish when we can show the position is not
     // behind what we believe is already on the node for this JID.
@@ -643,7 +681,7 @@ export function setupMdsSideEffects(
     lastConsideredPointerIdentity.set(jid, identity)
     if (decision === 'skip') return
 
-    dirty.add(jid, stanzaId)
+    dirty.add(jid, publish)
     schedulePublish()
   }
 
@@ -744,11 +782,17 @@ export function setupMdsSideEffects(
 
   const unsubscribeConversationMeta = chatStore.subscribe(
     (state) => state.conversationMeta,
-    considerConversations
+    () => {
+      considerConversations()
+      retryLegacyMigrations()
+    }
   )
   const unsubscribeMessages = chatStore.subscribe(
     (state) => state.messages,
-    considerConversations
+    () => {
+      considerConversations()
+      retryLegacyMigrations()
+    }
   )
   const unsubscribeConversationMam = chatStore.subscribe(
     (state) => state.mamQueryStates,
@@ -756,13 +800,19 @@ export function setupMdsSideEffects(
   )
   const unsubscribeRoomMeta = roomStore.subscribe(
     (state) => state.roomMeta,
-    considerRooms
+    () => {
+      considerRooms()
+      retryLegacyMigrations()
+    }
   )
   // The window, not the runtime blob: occupancy churn has no bearing on where
   // the read marker sits, and this now mirrors the chat subscription above.
   const unsubscribeRoomMessages = roomStore.subscribe(
     (state) => state.messages,
-    considerRooms
+    () => {
+      considerRooms()
+      retryLegacyMigrations()
+    }
   )
   const unsubscribeRoomMam = roomStore.subscribe(
     (state) => state.mamQueryStates,
@@ -817,6 +867,7 @@ export function setupMdsSideEffects(
     sessionEpoch++
     nodeSnapshotAuthoritative = false
     currentSessionConfirmedNodeJids.clear()
+    pendingLegacyMigrations.clear()
     void (async () => {
       const seedStartedAtRevision = nodeRevision
       let result: DisplayedMarkerFetchResult
@@ -903,6 +954,7 @@ export function setupMdsSideEffects(
       // cost nothing here — publishDecision() skips them without an IQ.
       considerConversations()
       considerRooms()
+      retryLegacyMigrations()
       logInfo('MDS: seeded read positions and enabled publishing')
     })()
   })
@@ -931,6 +983,7 @@ export function setupMdsSideEffects(
     trackedJids = conversationIds()
     considerConversations()
     considerRooms()
+    retryLegacyMigrations()
   })
 
   // On disconnect: DROP pending work and cancel the timer. The canonical pointer
@@ -973,6 +1026,7 @@ export function setupMdsSideEffects(
     unsubscribeConnection()
     dirty.drop()
     unroutedSeedMarkers.clear()
+    pendingLegacyMigrations.clear()
     if (debounceTimer) {
       clearTimeout(debounceTimer)
       debounceTimer = undefined

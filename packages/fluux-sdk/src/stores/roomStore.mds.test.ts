@@ -141,6 +141,7 @@ function reportRoomViewport(jid: string, evidence: 'at-edge' | 'away'): void {
 
 describe('roomStore.applyRemoteDisplayed', () => {
   beforeEach(() => {
+    roomStore.getState().clearFirstNewMessageId(ROOM)
     _resetStorageScopeForTesting()
     // Room read state is durable (#1081), so wiping roomMeta by hand is no
     // longer a clean slate: the next addRoom would restore the previous test's
@@ -195,6 +196,34 @@ describe('roomStore.applyRemoteDisplayed', () => {
     expect(after?.readPointer?.identity.messageId).toBe('m2')
   })
 
+  it('preserves a different pending marker when an older marker changes nothing', () => {
+    const messages = [
+      rmsg('m1', 's1', 1),
+      rmsg('m2', 's2', 2),
+      rmsg('m3', 's3', 3),
+      rmsg('m4', 's4', 4),
+      rmsg('m5', 's5', 5),
+    ]
+    seedRoom(ROOM, messages, 'm4')
+    roomStore.setState((state) => {
+      const meta = new Map(state.roomMeta)
+      meta.set(ROOM, { ...meta.get(ROOM)!, pendingRemoteDisplayedStanzaId: 's5' })
+      return {
+        activeRoomJid: ROOM,
+        roomMeta: meta,
+        firstNewMessageMarkers: new Map(state.firstNewMessageMarkers).set(ROOM, 'm4'),
+      }
+    })
+    const stateBefore = roomStore.getState()
+    const metaBefore = stateBefore.roomMeta.get(ROOM)
+
+    roomStore.getState().applyRemoteDisplayed(ROOM, 's2')
+
+    expect(roomStore.getState()).toBe(stateBefore)
+    expect(roomStore.getState().roomMeta.get(ROOM)).toBe(metaBefore)
+    expect(metaBefore?.pendingRemoteDisplayedStanzaId).toBe('s5')
+  })
+
   // The widening — at the store layer, where it actually bites. The store
   // CHOOSES the array: `mergeRoomMAMMessages` hands `applyRemoteDisplayed` a
   // single trimmed MAM page (`mergedForMarker`, roomStore.ts:3972), and the
@@ -247,6 +276,48 @@ describe('roomStore.applyRemoteDisplayed', () => {
 
     expect(roomStore.getState().roomMeta.get(ROOM)?.readPointer?.identity.messageId).toBe('m4')
     expect(roomSelectors.firstNewMessageIdFor(ROOM)(roomStore.getState())).toBe('m3')
+  })
+
+  it('carries the divider past a remote marker behind the local pointer', () => {
+    const messages = [
+      rmsg('m1', 's1', 1),
+      rmsg('m2', 's2', 2),
+      rmsg('m3', 's3', 3),
+      rmsg('m4', 's4', 4),
+      rmsg('m5', 's5', 5),
+    ]
+    seedRoom(ROOM, messages, 'm5')
+    roomStore.setState((state) => ({
+      activeRoomJid: ROOM,
+      firstNewMessageMarkers: new Map(state.firstNewMessageMarkers).set(ROOM, 'm1'),
+    }))
+
+    roomStore.getState().applyRemoteDisplayed(ROOM, 's3')
+
+    expect(roomStore.getState().roomMeta.get(ROOM)?.readPointer?.identity.messageId).toBe('m5')
+    expect(roomStore.getState().firstNewMessageMarkers.get(ROOM)).toBe('m4')
+  })
+
+  it('carries the divider when a remote marker successor becomes resident', () => {
+    const messages = [
+      rmsg('m1', 's1', 1),
+      rmsg('m2', 's2', 2),
+      rmsg('m3', 's3', 3),
+      rmsg('m4', 's4', 4),
+      rmsg('m5', 's5', 5),
+    ]
+    seedRoom(ROOM, messages, 'm3')
+    roomStore.setState((state) => ({
+      activeRoomJid: ROOM,
+      firstNewMessageMarkers: new Map(state.firstNewMessageMarkers).set(ROOM, 'm1'),
+    }))
+
+    roomStore.getState().applyRemoteDisplayed(ROOM, 's5')
+    expect(roomStore.getState().firstNewMessageMarkers.get(ROOM)).toBe('m1')
+
+    roomStore.getState().addMessage(ROOM, rmsg('m6', 's6', 6))
+
+    expect(roomStore.getState().firstNewMessageMarkers.get(ROOM)).toBe('m6')
   })
 
   it('does NOT recompute the divider for a non-active room', () => {

@@ -11,6 +11,11 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { chatStore } from './chatStore'
 import type { Message } from '../core'
 import { makeReadPointer } from './shared/readPointer'
+import { connectionStore } from './connectionStore'
+import {
+  clearLocallyPublishedDisplayed,
+  noteLocallyPublishedDisplayed,
+} from '../core/localMdsPublishes'
 
 const CID = 'alice@example.com'
 
@@ -44,6 +49,9 @@ function seedActive(lastSeen: string, marker: string) {
 
 describe('the active conversation keeps the divider its view opened with', () => {
   beforeEach(() => {
+    clearLocallyPublishedDisplayed('me@example.com')
+    connectionStore.setState({ jid: 'me@example.com/phone' })
+    chatStore.getState().clearFirstNewMessageId(CID)
     chatStore.setState({
       activeConversationId: undefined,
       conversationMeta: new Map(),
@@ -63,6 +71,71 @@ describe('the active conversation keeps the divider its view opened with', () =>
 
     expect(chatStore.getState().firstNewMessageMarkers.get(CID)).toBe('m4')
     expect(chatStore.getState().conversationMeta.get(CID)?.readPointer).not.toEqual(before)
+  })
+
+  it('follows a remote marker behind the local pointer', () => {
+    seedActive('m4', 'm1')
+
+    chatStore.getState().applyRemoteDisplayed(CID, 'stanza-m2', MESSAGES)
+
+    expect(chatStore.getState().conversationMeta.get(CID)?.readPointer?.identity.messageId).toBe('m4')
+    expect(chatStore.getState().firstNewMessageMarkers.get(CID)).toBe('m3')
+  })
+
+  it('follows a remote marker once its successor becomes resident', () => {
+    seedActive('m2', 'm1')
+
+    chatStore.getState().applyRemoteDisplayed(CID, 'stanza-m4', MESSAGES)
+    expect(chatStore.getState().firstNewMessageMarkers.get(CID)).toBe('m1')
+
+    chatStore.getState().addMessage(msg('m5'))
+
+    expect(chatStore.getState().firstNewMessageMarkers.get(CID)).toBe('m5')
+  })
+
+  it('does not restore a cleared line when a deferred successor arrives', () => {
+    seedActive('m2', 'm1')
+
+    chatStore.getState().applyRemoteDisplayed(CID, 'stanza-m4', MESSAGES)
+    chatStore.getState().clearFirstNewMessageId(CID)
+    chatStore.getState().addMessage(msg('m5'))
+
+    expect(chatStore.getState().firstNewMessageMarkers.get(CID)).toBeUndefined()
+  })
+
+  it('drops a deferred marker overtaken by a local publish', () => {
+    // The parked line must be OUTSIDE the slice, or the advance applies at once and nothing is
+    // deferred — the fixture would then describe a state it never reaches.
+    seedActive('m2', 'm1')
+    chatStore.setState({ messages: new Map([[CID, MESSAGES.slice(2)]]) })
+    chatStore.getState().applyRemoteDisplayed(CID, 'stanza-m3', MESSAGES.slice(2))
+    noteLocallyPublishedDisplayed(
+      'me@example.com',
+      CID,
+      makeReadPointer(MESSAGES[4], 'chat'),
+    )
+
+    chatStore.setState({ messages: new Map([[CID, MESSAGES]]) })
+
+    expect(chatStore.getState().firstNewMessageMarkers.get(CID)).toBe('m1')
+  })
+
+  it('writes nothing when a resolved marker moves neither the pointer nor the line', () => {
+    // This client publishes as it scrolls, and the account's node pushes every publish back. Those
+    // echoes resolve without advancing anything. Rebuilding the entry for each one re-derives it and
+    // re-renders every consumer, so a no-op must stay a no-op — identity is the assertion.
+    seedActive('m3', 'm4')
+    const before = {
+      meta: chatStore.getState().conversationMeta,
+      conversations: chatStore.getState().conversations,
+      markers: chatStore.getState().firstNewMessageMarkers,
+    }
+
+    chatStore.getState().applyRemoteDisplayed(CID, 'stanza-m2', MESSAGES)
+
+    expect(chatStore.getState().conversationMeta).toBe(before.meta)
+    expect(chatStore.getState().conversations).toBe(before.conversations)
+    expect(chatStore.getState().firstNewMessageMarkers).toBe(before.markers)
   })
 
   it('does not resurrect a line the reader cleared', () => {

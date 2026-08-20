@@ -66,7 +66,9 @@ import * as timeline from './shared/messageTimeline'
 import { shouldUpdateLastMessage, shouldReplaceLastMessage, isPreviewableMessage, findLastNonIgnoredMessage } from './shared/lastMessageUtils'
 import { derivePreviewAfterMerge } from './shared/previewState'
 import { addPendingRetraction, applyPendingRetractions, type PendingRetraction } from './shared/pendingRetractions'
-import { advanceDividerToRemoteRead } from './shared/dividerAdvance'
+import { createRemoteDividerAdvanceTracker } from './shared/dividerAdvance'
+import { locallyPublishedDisplayed } from '../core/localMdsPublishes'
+import { isAhead } from './shared/readPointer'
 import { resolveRemoteDisplayed, createMdsSessionGate, foldPendingRemoteDisplayed } from './shared/readMarkerSync'
 import { advance, makeReadPointer } from './shared/readPointer'
 import { loadRoomReadState, saveRoomReadState, clearRoomReadState, _clearAllRoomReadStateForTesting, type RoomReadState } from './shared/readStateStorage'
@@ -538,6 +540,7 @@ let activationToken = 0
 // XEP-0490 first-open-per-session fold gate (see shared/readMarkerSync;
 // parity with chatStore). Reset on reset() (logout).
 const mdsGate = createMdsSessionGate()
+const remoteDividerAdvances = createRemoteDividerAdvanceTracker()
 
 // Selector memoization caches.
 // Store selectors (joinedRooms, allRooms, etc.) are called on every Zustand subscription check.
@@ -1045,7 +1048,11 @@ export interface RoomState {
    * the read pointer forward-only. Pending and ordering semantics are owned by
    * the shared `readMarkerSync` resolver.
    */
-  applyRemoteDisplayed: (roomJid: string, stanzaId: string, messagesOverride?: RoomMessage[]) => void
+  applyRemoteDisplayed: (
+    roomJid: string,
+    stanzaId: string,
+    messagesOverride?: RoomMessage[],
+  ) => void
   setTyping: (roomJid: string, nick: string, isTyping: boolean) => void
 
   // Bookmark actions
@@ -1881,6 +1888,7 @@ export const roomStore = createStore<RoomState>()(
     roomPendingUnreadWrites.clear()
     roomEntityEpoch.clear()
     roomRecountRetry.clear()
+    remoteDividerAdvances.reset()
     // Tear down the OUTGOING account's transient overlay entries
     // before adopting the new scope — see lastRoomTransientScope's doc for
     // why this can't just read getStorageScopeJid() here.
@@ -1907,6 +1915,7 @@ export const roomStore = createStore<RoomState>()(
     roomPendingUnreadWrites.clear()
     roomEntityEpoch.clear()
     roomRecountRetry.clear()
+    remoteDividerAdvances.reset()
     // Logout tears down this account's transient overlay too.
     // Unlike switchAccount, nothing flips the global scope before reset()
     // runs (clearLocalData calls it directly), so getStorageScopeJid() here
@@ -2737,6 +2746,7 @@ export const roomStore = createStore<RoomState>()(
   },
 
   markReadToNewest: (roomJid) => {
+    remoteDividerAdvances.clear(roomJid)
     set((state) => {
       const existing = state.rooms.get(roomJid)
       if (!existing) return state
@@ -2794,6 +2804,8 @@ export const roomStore = createStore<RoomState>()(
     const prevJid = get().activeRoomJid
     // Skip if already the active room (prevents duplicate side effects)
     if (roomJid === prevJid) return
+    if (prevJid) remoteDividerAdvances.clear(prevJid)
+    if (roomJid) remoteDividerAdvances.clear(roomJid)
 
     // Deactivate previous room: clear its "new messages" marker (if any) and
     // EVICT its message array from RAM. Only the active room keeps its messages
@@ -3019,6 +3031,7 @@ export const roomStore = createStore<RoomState>()(
   getActiveRoomJid: () => get().activeRoomJid,
 
   clearFirstNewMessageId: (roomJid) => {
+    remoteDividerAdvances.clear(roomJid)
     set((state) => {
       const next = clearMarker(state.firstNewMessageMarkers, roomJid)
       return next ? { firstNewMessageMarkers: next } : state
@@ -3163,18 +3176,20 @@ export const roomStore = createStore<RoomState>()(
       )
       if (resolution.kind === 'unchanged') return state
 
+      const clearsPending = meta.pendingRemoteDisplayedStanzaId === stanzaId
       const metaPatch =
         resolution.kind === 'stash-pending'
           ? { pendingRemoteDisplayedStanzaId: stanzaId }
           : resolution.kind === 'clear-pending'
             ? { pendingRemoteDisplayedStanzaId: undefined }
+            : resolution.kind === 'resolved-active'
+              ? clearsPending
+                ? { pendingRemoteDisplayedStanzaId: undefined }
+                : undefined
             : {
                 readPointer: resolution.readPointer,
-                pendingRemoteDisplayedStanzaId: undefined,
+                ...(clearsPending && { pendingRemoteDisplayedStanzaId: undefined }),
               }
-
-      const newMeta = new Map(state.roomMeta)
-      newMeta.set(roomJid, { ...meta, ...metaPatch })
 
       // Inbound read-state sync (spec §4): a marker published by another
       // client advances this room's read position now, not on the next
@@ -3199,24 +3214,48 @@ export const roomStore = createStore<RoomState>()(
       // read, so leaving the divider in front of them would mark as new what the user has already
       // seen. Scrolling THIS view is not such evidence and does not come through here.
       let newMarkers = state.firstNewMessageMarkers
-      if (resolution.kind === 'advanced-active') {
-        const parked = state.firstNewMessageMarkers.get(roomJid)
-        const remote = notifState.onActivate(
-          {
-            unreadCount: 0,
-            mentionsCount: 0,
-            readPointer: resolution.readPointer,
-            firstNewMessageId: undefined,
-          },
-          messages,
-          'room'
-        ).firstNewMessageId
-        const next = advanceDividerToRemoteRead(parked, remote, messages)
-        if (next !== parked && next !== undefined) {
-          newMarkers = new Map(state.firstNewMessageMarkers)
-          newMarkers.set(roomJid, next)
+      // The line follows a marker only when it reaches FURTHER than anything this client has told
+      // the account it read. Publishing pushes to every resource of the account, so a marker at or
+      // behind our own last published position is our own scroll coming back — live, replayed, or
+      // re-read from the node on reconnect — and letting it move the line would make scrolling move
+      // it through a loop. Past that position it carries something we never claimed, whoever sent
+      // it. The wire cannot name the publisher; this is the question that can be answered.
+      if (resolution.kind === 'advanced-active' || resolution.kind === 'resolved-active') {
+        const markerPointer = resolution.kind === 'resolved-active'
+          ? resolution.markerPointer
+          : resolution.readPointer
+        const claimed = locallyPublishedDisplayed(
+          getBareJid(connectionStore.getState().jid ?? ''),
+          roomJid,
+        )
+        if (claimed === undefined || isAhead(markerPointer, claimed)) {
+          const dividerAdvance = remoteDividerAdvances.apply(
+            roomJid,
+            state.firstNewMessageMarkers.get(roomJid),
+            markerPointer,
+            messages,
+            'room',
+          )
+          if (dividerAdvance.kind === 'advanced') {
+            newMarkers = new Map(state.firstNewMessageMarkers)
+            newMarkers.set(roomJid, dividerAdvance.divider)
+          }
         }
       }
+      // `resolved-active` exists only to give a live divider a chance to move; it advances no
+      // pointer. When the divider did not move and no pending marker needed clearing, nothing
+      // changed — and rebuilding the entry here would re-derive it and re-render every consumer on
+      // each echo of this client's own scrolling.
+      if (
+        resolution.kind === 'resolved-active' &&
+        newMarkers === state.firstNewMessageMarkers &&
+        metaPatch === undefined
+      ) {
+        return state
+      }
+
+      const newMeta = metaPatch ? new Map(state.roomMeta) : state.roomMeta
+      if (metaPatch) newMeta.set(roomJid, { ...meta, ...metaPatch })
 
       // A position another device read to is a read position like any other —
       // persist it. The stash/clear kinds move no pointer.
@@ -3224,7 +3263,7 @@ export const roomStore = createStore<RoomState>()(
         persistRoomReadState(newMeta)
       }
 
-      if (existing) {
+      if (existing && metaPatch) {
         // Keep the combined map coherent with roomMeta.
         const newRooms = new Map(state.rooms)
         newRooms.set(roomJid, { ...existing, ...metaPatch })
@@ -4435,3 +4474,33 @@ export const roomStore = createStore<RoomState>()(
   },
 }))
 )
+
+roomStore.subscribe((state, previous) => {
+  const roomJid = state.activeRoomJid
+  if (!roomJid || !remoteDividerAdvances.has(roomJid)) return
+  const parked = state.firstNewMessageMarkers.get(roomJid)
+  if (parked === undefined) {
+    remoteDividerAdvances.clear(roomJid)
+    return
+  }
+  if (state.messages.get(roomJid) === previous.messages.get(roomJid)) return
+
+  const result = remoteDividerAdvances.retry(
+    roomJid,
+    parked,
+    state.messages.get(roomJid) ?? [],
+    'room',
+    locallyPublishedDisplayed(
+      getBareJid(connectionStore.getState().jid ?? ''),
+      roomJid,
+    ),
+  )
+  if (result.kind === 'advanced') {
+    roomStore.setState((current) => ({
+      firstNewMessageMarkers: new Map(current.firstNewMessageMarkers).set(
+        roomJid,
+        result.divider,
+      ),
+    }))
+  }
+})

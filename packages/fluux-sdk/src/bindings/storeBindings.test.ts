@@ -185,7 +185,7 @@ describe('createStoreBindings', () => {
       })
       expect(mockStores.chat.applyRemoteDisplayed).toHaveBeenCalledWith(
         'juliet@capulet.example',
-        'stanza-77'
+        'stanza-77',
       )
     })
 
@@ -203,6 +203,7 @@ describe('createStoreBindings', () => {
       expect(mockStores.chat.applyRemoteDisplayed).toHaveBeenCalledWith('juliet@capulet.example', 's8')
       expect(mockStores.room.applyRemoteDisplayed).not.toHaveBeenCalled()
     })
+
   })
 
   describe('MAM anchor-purged events (purged id-exact catch-up cursor)', () => {

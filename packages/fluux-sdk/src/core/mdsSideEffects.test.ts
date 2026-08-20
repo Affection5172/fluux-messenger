@@ -17,7 +17,13 @@ Object.defineProperty(globalThis, 'localStorage', {
   writable: true,
 })
 
+import {
+  noteLocallyPublishedDisplayed,
+  clearLocallyPublishedDisplayed,
+} from './localMdsPublishes'
 import { setupMdsSideEffects } from './mdsSideEffects'
+import { createStoreBindings, type StoreRefs } from '../bindings/storeBindings'
+import { createMockStoreRefs, type MockStoreRefs } from './test-utils'
 import { chatStore } from '../stores/chatStore'
 import { connectionStore } from '../stores/connectionStore'
 import { roomStore } from '../stores/roomStore'
@@ -270,6 +276,7 @@ function setRoomMamState(
 describe('setupMdsSideEffects', () => {
   beforeEach(() => {
     vi.useFakeTimers()
+    clearLocallyPublishedDisplayed('romeo@montague.example')
     connectionStore.getState().reset()
     chatStore.getState().reset()
     roomStore.getState().reset()
@@ -299,6 +306,177 @@ describe('setupMdsSideEffects', () => {
     expect(client.internal.mds.publishDisplayed).toHaveBeenCalledTimes(1)
     // 1:1 → by is our own bare JID (the archive that assigned the stanza-id).
     expect(client.internal.mds.publishDisplayed).toHaveBeenCalledWith(cid, 's2', 'romeo@montague.example')
+    cleanup()
+  })
+
+  it('withdraws a local claim after a definitive publish rejection', async () => {
+    const cid = 'juliet@capulet.example'
+    const account = 'romeo@montague.example'
+    const client = makeClient()
+    connectionStore.setState({ status: 'online', jid: `${account}/phone` } as never)
+    const messages = [
+      msg('m1', 's1'),
+      msg('m2', 's2'),
+      msg('m3', 's3'),
+      msg('m4', 's4'),
+      msg('m5', 's5'),
+    ]
+    seedMessages(cid, messages)
+    seedMeta(cid, 'm1')
+    chatStore.setState({
+      activeConversationId: cid,
+      firstNewMessageMarkers: new Map([[cid, 'm1']]),
+    })
+    noteLocallyPublishedDisplayed(account, cid, makeReadPointer(messages[0], 'chat'))
+    client.internal.mds.publishDisplayed.mockRejectedValue(
+      Object.assign(new Error('forbidden'), { name: 'StanzaError', condition: 'forbidden' }),
+    )
+
+    const cleanup = setupMdsSideEffects(client as never)
+    client._emit('online')
+    await vi.runOnlyPendingTimersAsync()
+    patchMeta(cid, { readPointer: makeReadPointer(messages[4], 'chat') })
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    chatStore.getState().applyRemoteDisplayed(cid, 's3')
+
+    expect(chatStore.getState().firstNewMessageMarkers.get(cid)).toBe('m4')
+    cleanup()
+  })
+
+  it('retains a local claim after an ambiguous publish failure', async () => {
+    const cid = 'juliet@capulet.example'
+    const account = 'romeo@montague.example'
+    const client = makeClient()
+    connectionStore.setState({ status: 'online', jid: `${account}/phone` } as never)
+    const messages = [
+      msg('m1', 's1'),
+      msg('m2', 's2'),
+      msg('m3', 's3'),
+      msg('m4', 's4'),
+      msg('m5', 's5'),
+    ]
+    seedMessages(cid, messages)
+    seedMeta(cid, 'm1')
+    chatStore.setState({
+      activeConversationId: cid,
+      firstNewMessageMarkers: new Map([[cid, 'm1']]),
+    })
+    client.internal.mds.publishDisplayed.mockRejectedValue(new Error('timeout'))
+
+    const cleanup = setupMdsSideEffects(client as never)
+    client._emit('online')
+    await vi.runOnlyPendingTimersAsync()
+    patchMeta(cid, { readPointer: makeReadPointer(messages[4], 'chat') })
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    chatStore.getState().applyRemoteDisplayed(cid, 's3')
+
+    expect(chatStore.getState().firstNewMessageMarkers.get(cid)).toBe('m1')
+    cleanup()
+  })
+
+  it('ignores an echo of a position this client already published', async () => {
+    const cid = 'juliet@capulet.example'
+    const account = 'romeo@montague.example'
+    const client = makeClient()
+    const mockStores: MockStoreRefs = createMockStoreRefs()
+    mockStores.connection.jid = `${account}/phone`
+    const applyRemoteDisplayed = vi.fn(
+      (conversationId: string, stanzaId: string) => {
+        chatStore.getState().applyRemoteDisplayed(conversationId, stanzaId)
+      },
+    )
+    mockStores.chat.applyRemoteDisplayed = applyRemoteDisplayed as never
+    const unbind = createStoreBindings(
+      client as never,
+      () => mockStores as unknown as StoreRefs,
+    )
+    connectionStore.setState({ status: 'online', jid: `${account}/phone` } as never)
+    client.internal.mds.fetchAllDisplayed = vi
+      .fn()
+      .mockResolvedValue([{ conversationJid: cid, stanzaId: 's1' }])
+    seedMessages(cid, [msg('m1', 's1'), msg('m2', 's2'), msg('m3', 's3')])
+    seedMeta(cid, 'm1')
+    const cleanup = setupMdsSideEffects(client as never)
+    client._emit('online')
+    await vi.runOnlyPendingTimersAsync()
+    chatStore.setState({
+      activeConversationId: cid,
+      firstNewMessageMarkers: new Map([[cid, 'm1']]),
+    })
+
+    patchMeta(cid, { readPointer: makeReadPointer(msg('m2', 's2'), 'chat') })
+    await vi.advanceTimersByTimeAsync(2_000)
+    client._emit('read:displayed-synced', { conversationId: cid, stanzaId: 's2' })
+
+    // Applied like any other marker — the pointer and the pending bookkeeping still need it — but
+    // classified as this client's own, which is the only thing the divider consults. The scroll that
+    // produced the publish must not come back as a reason to move the line.
+    expect(applyRemoteDisplayed).toHaveBeenCalledWith(cid, 's2')
+    expect(chatStore.getState().firstNewMessageMarkers.get(cid)).toBe('m1')
+    unbind()
+    cleanup()
+  })
+
+  it('ignores that echo through the reconnect seed too', async () => {
+    // The seed re-reads the whole node on `online` and applies each marker directly, without going
+    // through the live event. That second entrance is how an echo used to slip past classification
+    // — and a stream-management replay arrives the same way, however long after the publish.
+    const cid = 'juliet@capulet.example'
+    const account = 'romeo@montague.example'
+    const client = makeClient()
+    connectionStore.setState({ status: 'online', jid: `${account}/phone` } as never)
+    seedMessages(cid, [msg('m1', 's1'), msg('m2', 's2'), msg('m3', 's3')])
+    seedMeta(cid, 'm1')
+    chatStore.setState({
+      activeConversationId: cid,
+      firstNewMessageMarkers: new Map([[cid, 'm1']]),
+    })
+    patchMeta(cid, { readPointer: makeReadPointer(msg('m2', 's2'), 'chat') })
+
+    // This client publishes s2 from its own reading, then reconnects and the node hands it back.
+    noteLocallyPublishedDisplayed(account, cid, makeReadPointer(msg('m2', 's2'), 'chat'))
+    client.internal.mds.fetchAllDisplayed = vi
+      .fn()
+      .mockResolvedValue([{ conversationJid: cid, stanzaId: 's2' }])
+    const cleanup = setupMdsSideEffects(client as never)
+    client._emit('online')
+    await vi.runOnlyPendingTimersAsync()
+
+    expect(chatStore.getState().firstNewMessageMarkers.get(cid)).toBe('m1')
+    clearLocallyPublishedDisplayed(account)
+    cleanup()
+  })
+
+  it('keeps published positions across side-effect rebinding', async () => {
+    const cid = 'juliet@capulet.example'
+    const account = 'romeo@montague.example'
+    const client = makeClient()
+    connectionStore.setState({ status: 'online', jid: `${account}/phone` } as never)
+    seedMessages(cid, [msg('m1', 's1'), msg('m2', 's2'), msg('m3', 's3')])
+    seedMeta(cid, 'm1')
+    chatStore.setState({
+      activeConversationId: cid,
+      firstNewMessageMarkers: new Map([[cid, 'm1']]),
+    })
+
+    let cleanup = setupMdsSideEffects(client as never)
+    client._emit('online')
+    await vi.runOnlyPendingTimersAsync()
+    patchMeta(cid, { readPointer: makeReadPointer(msg('m2', 's2'), 'chat') })
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(client.internal.mds.publishDisplayed).toHaveBeenCalledWith(cid, 's2', account)
+
+    cleanup()
+    client.internal.mds.fetchAllDisplayed = vi
+      .fn()
+      .mockResolvedValue([{ conversationJid: cid, stanzaId: 's2' }])
+    cleanup = setupMdsSideEffects(client as never)
+    client._emit('online')
+    await vi.runOnlyPendingTimersAsync()
+
+    expect(chatStore.getState().firstNewMessageMarkers.get(cid)).toBe('m1')
     cleanup()
   })
 
@@ -1253,6 +1431,63 @@ describe('setupMdsSideEffects', () => {
     cleanup()
   })
 
+  it('lets a migrated marker place the line, then ignores one behind our own reading', async () => {
+    const cid = 'juliet@capulet.example'
+    const client = makeClient()
+    client.internal.mds.fetchAllDisplayed = vi
+      .fn()
+      .mockResolvedValue([{ conversationJid: cid, stanzaId: 's1', legacy: true }])
+    connectionStore.setState({ status: 'online', jid: 'romeo@montague.example/phone' } as never)
+    addConversation(cid)
+    seedMessages(cid, [msg('m1', 's1'), msg('m2', 's2'), msg('m3', 's3'), msg('m4', 's4')])
+    seedMeta(cid, 'm3')
+    chatStore.setState({
+      activeConversationId: cid,
+      firstNewMessageMarkers: new Map([[cid, 'm1']]),
+    })
+
+    const cleanup = setupMdsSideEffects(client as never)
+    client._emit('online')
+    await vi.runOnlyPendingTimersAsync()
+
+    expect(client.internal.mds.publishDisplayed).toHaveBeenCalledWith(
+      cid,
+      's1',
+      'romeo@montague.example',
+    )
+    expect(chatStore.getState().firstNewMessageMarkers.get(cid)).toBe('m2')
+
+    // s2 is behind the position this client published from its own pointer (m3), so it tells us
+    // nothing we had not already claimed — our own scrolling must not move the line through it.
+    chatStore.getState().applyRemoteDisplayed(cid, 's2')
+
+    expect(chatStore.getState().firstNewMessageMarkers.get(cid)).toBe('m2')
+    cleanup()
+  })
+
+  it('migrates an off-slice legacy marker without waiting for its message', async () => {
+    // Migration rewrites a payload format. It carries no claim about what THIS client read, so it
+    // needs no local position and must not wait for the marker's message to load.
+    const cid = 'juliet@capulet.example'
+    const client = makeClient()
+    client.internal.mds.fetchAllDisplayed = vi
+      .fn()
+      .mockResolvedValue([{ conversationJid: cid, stanzaId: 's1', legacy: true }])
+    connectionStore.setState({ status: 'online', jid: 'romeo@montague.example/phone' } as never)
+    addConversation(cid)
+
+    const cleanup = setupMdsSideEffects(client as never)
+    client._emit('online')
+    await vi.runOnlyPendingTimersAsync()
+
+    expect(client.internal.mds.publishDisplayed).toHaveBeenCalledWith(
+      cid,
+      's1',
+      'romeo@montague.example',
+    )
+    cleanup()
+  })
+
   it('a failed legacy migration does not break the seed or later publishing', async () => {
     const cid = 'juliet@capulet.example'
     const client = makeClient()
@@ -1278,6 +1513,42 @@ describe('setupMdsSideEffects', () => {
     await vi.advanceTimersByTimeAsync(2_000)
 
     expect(client.internal.mds.publishDisplayed).toHaveBeenCalledWith(cid, 's2', 'romeo@montague.example')
+    cleanup()
+  })
+
+  it('withdraws a migrated claim after a definitive rejection', async () => {
+    const cid = 'juliet@capulet.example'
+    const account = 'romeo@montague.example'
+    const client = makeClient()
+    client.internal.mds.fetchAllDisplayed = vi
+      .fn()
+      .mockResolvedValue([{ conversationJid: cid, stanzaId: 's5', legacy: true }])
+    client.internal.mds.publishDisplayed.mockRejectedValue(
+      Object.assign(new Error('conflict'), { name: 'StanzaError', condition: 'conflict' }),
+    )
+    connectionStore.setState({ status: 'online', jid: `${account}/phone` } as never)
+    addConversation(cid)
+    const messages = [
+      msg('m1', 's1'),
+      msg('m2', 's2'),
+      msg('m3', 's3'),
+      msg('m4', 's4'),
+      msg('m5', 's5'),
+    ]
+    seedMessages(cid, messages)
+    seedMeta(cid, 'm5')
+
+    const cleanup = setupMdsSideEffects(client as never)
+    client._emit('online')
+    await vi.runOnlyPendingTimersAsync()
+    chatStore.setState({
+      activeConversationId: cid,
+      firstNewMessageMarkers: new Map([[cid, 'm1']]),
+    })
+
+    chatStore.getState().applyRemoteDisplayed(cid, 's3')
+
+    expect(chatStore.getState().firstNewMessageMarkers.get(cid)).toBe('m4')
     cleanup()
   })
 

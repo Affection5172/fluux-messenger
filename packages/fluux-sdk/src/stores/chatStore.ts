@@ -50,7 +50,10 @@ import { isPreviewableMessage, findLastPreviewableMessage, shouldReplaceLastMess
 import { derivePreviewAfterMerge } from './shared/previewState'
 import { draftConversationMaps, rebuildCompatEntry } from './shared/conversationMaps'
 import { addPendingRetraction, applyPendingRetractions, type PendingRetraction } from './shared/pendingRetractions'
-import { advanceDividerToRemoteRead } from './shared/dividerAdvance'
+import { createRemoteDividerAdvanceTracker } from './shared/dividerAdvance'
+import { locallyPublishedDisplayed } from '../core/localMdsPublishes'
+import { isAhead } from './shared/readPointer'
+import { getBareJid } from '../core/jid'
 import { resolveRemoteDisplayed, createMdsSessionGate, foldPendingRemoteDisplayed } from './shared/readMarkerSync'
 import {
   advance,
@@ -116,6 +119,7 @@ let activationToken = 0
 // Reset on reset() (logout/account switch); module-level so it is naturally
 // per app session.
 const mdsGate = createMdsSessionGate()
+const remoteDividerAdvances = createRemoteDividerAdvanceTracker()
 
 function getScopedStorageKey(jid?: string | null): string {
   return buildScopedStorageKey(STORAGE_KEY_BASE, jid)
@@ -397,7 +401,11 @@ interface ChatState {
    * the read pointer forward-only. Pending and ordering semantics are owned by
    * the shared `readMarkerSync` resolver.
    */
-  applyRemoteDisplayed: (conversationId: string, stanzaId: string, messagesOverride?: Message[]) => void
+  applyRemoteDisplayed: (
+    conversationId: string,
+    stanzaId: string,
+    messagesOverride?: Message[],
+  ) => void
   hasConversation: (id: string) => boolean
   archiveConversation: (id: string) => void
   unarchiveConversation: (id: string) => void
@@ -1379,6 +1387,8 @@ export const chatStore = createStore<ChatState>()(
         const prevId = get().activeConversationId
         // Skip if already the active conversation (prevents duplicate side effects)
         if (id === prevId) return
+        if (prevId) remoteDividerAdvances.clear(prevId)
+        if (id) remoteDividerAdvances.clear(id)
 
         // Deactivate previous conversation: clear its "new messages" marker (if
         // any) and EVICT its message array from RAM. Only the active conversation
@@ -1954,6 +1964,7 @@ export const chatStore = createStore<ChatState>()(
       },
 
       markReadToNewest: (conversationId) => {
+        remoteDividerAdvances.clear(conversationId)
         set((state) => {
           const existing = state.conversations.get(conversationId)
           if (!existing) return state
@@ -1997,6 +2008,7 @@ export const chatStore = createStore<ChatState>()(
       },
 
       clearFirstNewMessageId: (conversationId) => {
+        remoteDividerAdvances.clear(conversationId)
         set((state) => {
           const next = clearMarker(state.firstNewMessageMarkers, conversationId)
           return next ? { firstNewMessageMarkers: next } : state
@@ -2137,18 +2149,23 @@ export const chatStore = createStore<ChatState>()(
           )
           if (resolution.kind === 'unchanged') return state
 
+          const clearsPending = meta.pendingRemoteDisplayedStanzaId === stanzaId
           const metaPatch =
             resolution.kind === 'stash-pending'
               ? { pendingRemoteDisplayedStanzaId: stanzaId }
               : resolution.kind === 'clear-pending'
                 ? { pendingRemoteDisplayedStanzaId: undefined }
+                : resolution.kind === 'resolved-active'
+                  ? clearsPending
+                    ? { pendingRemoteDisplayedStanzaId: undefined }
+                    : undefined
                 : {
                     readPointer: resolution.readPointer,
-                    pendingRemoteDisplayedStanzaId: undefined,
+                    ...(clearsPending && { pendingRemoteDisplayedStanzaId: undefined }),
                   }
 
           const draft = draftConversationMaps(state)
-          draft.patchMeta(conversationId, metaPatch)
+          if (metaPatch) draft.patchMeta(conversationId, metaPatch)
 
           // Inbound read-state sync (spec §4): a marker published by another
           // client advances this conversation's read position now, not on the
@@ -2172,23 +2189,45 @@ export const chatStore = createStore<ChatState>()(
           // were read, so leaving the divider in front of them would mark as new what the user has
           // already seen. Scrolling THIS view is not such evidence and does not come through here.
           let newMarkers = state.firstNewMessageMarkers
-          if (resolution.kind === 'advanced-active') {
-            const parked = state.firstNewMessageMarkers.get(conversationId)
-            const remote = notifState.onActivate(
-              {
-                unreadCount: 0,
-                mentionsCount: 0,
-                readPointer: resolution.readPointer,
-                firstNewMessageId: undefined,
-              },
-              messages,
-              'chat'
-            ).firstNewMessageId
-            const next = advanceDividerToRemoteRead(parked, remote, messages)
-            if (next !== parked && next !== undefined) {
-              newMarkers = new Map(state.firstNewMessageMarkers)
-              newMarkers.set(conversationId, next)
+          // The line follows a marker only when it reaches FURTHER than anything this client has told
+          // the account it read. Publishing pushes to every resource of the account, so a marker at or
+          // behind our own last published position is our own scroll coming back — live, replayed, or
+          // re-read from the node on reconnect — and letting it move the line would make scrolling move
+          // it through a loop. Past that position it carries something we never claimed, whoever sent
+          // it. The wire cannot name the publisher; this is the question that can be answered.
+          if (resolution.kind === 'advanced-active' || resolution.kind === 'resolved-active') {
+            const markerPointer = resolution.kind === 'resolved-active'
+              ? resolution.markerPointer
+              : resolution.readPointer
+            const claimed = locallyPublishedDisplayed(
+              getBareJid(connectionStore.getState().jid ?? ''),
+              conversationId,
+            )
+            if (claimed === undefined || isAhead(markerPointer, claimed)) {
+              const dividerAdvance = remoteDividerAdvances.apply(
+                conversationId,
+                state.firstNewMessageMarkers.get(conversationId),
+                markerPointer,
+                messages,
+                'chat',
+              )
+              if (dividerAdvance.kind === 'advanced') {
+                newMarkers = new Map(state.firstNewMessageMarkers)
+                newMarkers.set(conversationId, dividerAdvance.divider)
+              }
             }
+          }
+
+          // `resolved-active` exists only to give a live divider a chance to move; it advances no
+          // pointer. When the divider did not move and no pending marker needed clearing, nothing
+          // changed — and rebuilding the entry here would re-derive it and re-render every consumer on
+          // each echo of this client's own scrolling.
+          if (
+            resolution.kind === 'resolved-active' &&
+            newMarkers === state.firstNewMessageMarkers &&
+            metaPatch === undefined
+          ) {
+            return state
           }
 
           return { ...draft.commit(), firstNewMessageMarkers: newMarkers }
@@ -3450,6 +3489,7 @@ export const chatStore = createStore<ChatState>()(
         chatPendingUnreadWrites.clear()
         chatEntityEpoch.clear()
         chatRecountRetry.clear()
+        remoteDividerAdvances.reset()
         // Tear down the OUTGOING account's transient overlay entries
         // before adopting the new scope — see lastChatTransientScope's doc for
         // why this can't just read getStorageScopeJid() here.
@@ -3471,6 +3511,7 @@ export const chatStore = createStore<ChatState>()(
         chatPendingUnreadWrites.clear()
         chatEntityEpoch.clear()
         chatRecountRetry.clear()
+        remoteDividerAdvances.reset()
         // Logout tears down this account's transient overlay too.
         // Unlike switchAccount, nothing flips the global scope before reset()
         // runs (clearLocalData calls it directly), so getStorageScopeJid()
@@ -3584,5 +3625,35 @@ export const chatStore = createStore<ChatState>()(
     )
   )
 )
+
+chatStore.subscribe((state, previous) => {
+  const conversationId = state.activeConversationId
+  if (!conversationId || !remoteDividerAdvances.has(conversationId)) return
+  const parked = state.firstNewMessageMarkers.get(conversationId)
+  if (parked === undefined) {
+    remoteDividerAdvances.clear(conversationId)
+    return
+  }
+  if (state.messages.get(conversationId) === previous.messages.get(conversationId)) return
+
+  const result = remoteDividerAdvances.retry(
+    conversationId,
+    parked,
+    state.messages.get(conversationId) ?? [],
+    'chat',
+    locallyPublishedDisplayed(
+      getBareJid(connectionStore.getState().jid ?? ''),
+      conversationId,
+    ),
+  )
+  if (result.kind === 'advanced') {
+    chatStore.setState((current) => ({
+      firstNewMessageMarkers: new Map(current.firstNewMessageMarkers).set(
+        conversationId,
+        result.divider,
+      ),
+    }))
+  }
+})
 
 export type { ChatState }

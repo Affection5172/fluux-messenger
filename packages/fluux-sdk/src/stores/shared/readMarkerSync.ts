@@ -37,6 +37,13 @@ export type RemoteDisplayedResolution =
    */
   | { kind: 'clear-pending' }
   /**
+   * The marker resolved but sits at or behind the local read pointer, on an ACTIVE entity that
+   * still shows a divider. No pointer moves — but the line might: the marker is another device
+   * stating it read that far, and the line may still stand in front of what it read. It carries the
+   * MARKER's own position, not ours, because that is the boundary the line is compared against.
+   */
+  | { kind: 'resolved-active'; markerPointer: ReadPointer }
+  /**
    * Forward advance. The whole read position travels as one `readPointer`
    * (#1081); divider placement remains owned by activation.
    */
@@ -111,15 +118,25 @@ export function resolveRemoteDisplayed<T extends NotificationMessage & { stanzaI
   kind: 'chat' | 'room',
   options: { isActive: boolean }
 ): RemoteDisplayedResolution {
+  // Re-recording the stanza already stashed changes nothing, and the stores rebuild an entry for
+  // every resolution that is not `unchanged`. A duplicate notification, a reconnect seed and a
+  // stream-management replay all deliver the same marker again, so saying so costs a re-render each.
+  const alreadyStashed = meta.pendingRemoteDisplayedStanzaId === stanzaId
+  const stash = (): RemoteDisplayedResolution =>
+    alreadyStashed ? { kind: 'unchanged' } : { kind: 'stash-pending' }
+
   const match = messages.find((m) => m.stanzaId === stanzaId)
-  if (!match) return { kind: 'stash-pending' }
+  if (!match) return stash()
 
   const outcome = resolveAdvance(meta.readPointer, match, messages, meta, currentFirstNewMessageId, kind)
-  if (outcome === 'undecidable') return { kind: 'stash-pending' }
+  if (outcome === 'undecidable') return stash()
   if (outcome === 'no-advance') {
-    return meta.pendingRemoteDisplayedStanzaId === undefined
-      ? { kind: 'unchanged' }
-      : { kind: 'clear-pending' }
+    if (options.isActive && currentFirstNewMessageId !== undefined) {
+      return { kind: 'resolved-active', markerPointer: makeReadPointer(match, kind) }
+    }
+    return meta.pendingRemoteDisplayedStanzaId === stanzaId
+      ? { kind: 'clear-pending' }
+      : { kind: 'unchanged' }
   }
   const readPointer = outcome
 
